@@ -38,6 +38,15 @@ not silently unsupported or half-implemented.
   `ClientBuilder` (applied to every request, overridable per-request).
   The URL parser still rejects `user:pass@host` userinfo syntax --
   these helpers are the supported way to set credentials for now.
+- **Redirects**: 301/302/303/307/308 are followed automatically (capped
+  at 30 hops by default; `.max_redirects(n)`/`.no_redirects()` on either
+  `RequestBuilder` or `ClientBuilder` to change that). 303 always
+  downgrades to a bodyless GET, 307/308 always preserve the original
+  method and body, and 301/302 downgrade to a bodyless GET for any
+  method other than GET/HEAD -- the same rules browsers and `requests`
+  use, since the spec itself is looser. `Authorization` is stripped on
+  any hop that changes host or port, so credentials never leak to a
+  different origin.
 - **HTTP/1.1 framing**: `Content-Length` and `Transfer-Encoding: chunked`
   response bodies, plus close-delimited (EOF-terminated) bodies as a
   fallback. No connection reuse -- every request opens a fresh TCP
@@ -74,6 +83,16 @@ async fn main() -> rusty_request::Result<()> {
 
     let created = resp.json()?;
     println!("{:?}", created.get("id"));
+
+    // Redirects are followed automatically; opt out per-request if you
+    // want the raw 3xx instead:
+    let raw_redirect = client
+        .get("http://example.com/moved")?
+        .no_redirects()
+        .send()
+        .await?;
+    println!("{}", raw_redirect.status());
+
     Ok(())
 }
 ```
@@ -86,8 +105,8 @@ Tracked as issues in this repository:
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
 - **`Session`-style cookie jar** -- persisting cookies across requests
-  made with the same `Client`.
-- **Automatic redirect following** (3xx responses).
+  made with the same `Client` (and, once it exists, across redirect
+  hops too).
 - **Multipart file uploads**.
 - **Retry/backoff**.
 - **Streaming request and response bodies** -- everything is fully

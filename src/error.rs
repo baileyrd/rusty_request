@@ -28,6 +28,10 @@ pub enum Error {
     /// [`crate::Response::error_for_status`] was called on a response
     /// with a 4xx/5xx status.
     Status(crate::status::StatusCode),
+    /// A redirect chain exceeded the configured cap (see
+    /// `RequestBuilder::max_redirects`/`ClientBuilder::max_redirects`)
+    /// without settling on a non-redirect response.
+    TooManyRedirects(usize),
 }
 
 impl fmt::Display for Error {
@@ -44,6 +48,9 @@ impl fmt::Display for Error {
             Error::Json(s) => write!(f, "json error: {s}"),
             Error::Timeout => write!(f, "request timed out"),
             Error::Status(s) => write!(f, "http error status {s}"),
+            Error::TooManyRedirects(max) => {
+                write!(f, "exceeded the maximum number of redirects ({max})")
+            }
         }
     }
 }

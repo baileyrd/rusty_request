@@ -45,6 +45,23 @@ impl HeaderMap {
         self.get(name).is_some()
     }
 
+    /// Removes every entry for `name` (case-insensitive), returning the
+    /// first removed value, if any.
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        let mut removed = None;
+        self.entries.retain(|(k, v)| {
+            if k.eq_ignore_ascii_case(name) {
+                if removed.is_none() {
+                    removed = Some(v.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
@@ -107,6 +124,18 @@ mod tests {
     fn rejects_crlf_injection_in_value() {
         let mut h = HeaderMap::new();
         assert!(h.insert("X-A", "evil\r\nX-Injected: yes").is_err());
+    }
+
+    #[test]
+    fn remove_drops_all_case_insensitive_matches() {
+        let mut h = HeaderMap::new();
+        h.append("X-A", "1").unwrap();
+        h.append("x-a", "2").unwrap();
+        h.append("X-B", "3").unwrap();
+        assert_eq!(h.remove("x-A"), Some("1".to_string()));
+        assert!(!h.contains("x-a"));
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.remove("missing"), None);
     }
 
     #[test]

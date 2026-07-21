@@ -112,6 +112,108 @@ impl Url {
             ..self.clone()
         }
     }
+
+    /// Resolves a `Location` header value against `self` (the request
+    /// URL that produced it), per the RFC 3986 §5.3 "Component
+    /// Recomposition" algorithm -- simplified, since `Location` is
+    /// never a fragment-only or same-document reference in practice.
+    /// Handles absolute URLs (`http://...`), protocol-relative
+    /// (`//host/path`), absolute-path (`/path`), and relative-path
+    /// references (`path`, `../path`, `?query`), the last resolved via
+    /// RFC 3986 §5.2's merge + dot-segment removal.
+    pub(crate) fn resolve_redirect(&self, location: &str) -> Result<Url> {
+        let location = location.trim();
+        if location.is_empty() {
+            return Err(Error::InvalidResponse(
+                "redirect response had an empty Location header".to_string(),
+            ));
+        }
+
+        if let Some(idx) = location.find("://") {
+            let scheme_candidate = &location[..idx];
+            let looks_like_scheme = !scheme_candidate.is_empty()
+                && scheme_candidate
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+            if looks_like_scheme {
+                return Url::parse(location);
+            }
+        }
+
+        if let Some(rest) = location.strip_prefix("//") {
+            return Url::parse(&format!("{}://{}", self.scheme, rest));
+        }
+
+        if let Some(path_and_query) = location.strip_prefix('/') {
+            let (path, query) = split_path_query(&format!("/{path_and_query}"));
+            return Ok(Url {
+                scheme: self.scheme.clone(),
+                host: self.host.clone(),
+                port: self.port,
+                path,
+                query,
+            });
+        }
+
+        let (rel_path, rel_query) = split_path_query(location);
+        let merged = merge_paths(&self.path, &rel_path);
+        Ok(Url {
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            path: remove_dot_segments(&merged),
+            query: rel_query,
+        })
+    }
+}
+
+fn split_path_query(s: &str) -> (String, Option<String>) {
+    match s.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (s.to_string(), None),
+    }
+}
+
+/// RFC 3986 §5.3's merge step: replaces everything in `base_path` from
+/// the last `/` onward with `rel_path`. An empty `rel_path` (a
+/// query-only or same-path reference, e.g. `Location: ?x=1`) leaves
+/// `base_path` untouched.
+fn merge_paths(base_path: &str, rel_path: &str) -> String {
+    if rel_path.is_empty() {
+        return base_path.to_string();
+    }
+    match base_path.rfind('/') {
+        Some(idx) => format!("{}{}", &base_path[..=idx], rel_path),
+        None => format!("/{rel_path}"),
+    }
+}
+
+/// RFC 3986 §5.2.4, simplified: resolves `.`/`..` segments against a
+/// path that's already known to start with `/` (every `Url::path` and
+/// every merge-step output does). `..` past the root is ignored rather
+/// than erroring, matching how browsers handle it.
+fn remove_dot_segments(path: &str) -> String {
+    let mut output: Vec<&str> = vec![""];
+    let trailing_slash = path.ends_with('/');
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if output.len() > 1 {
+                    output.pop();
+                }
+            }
+            other => output.push(other),
+        }
+    }
+    let mut result = output.join("/");
+    if result.is_empty() {
+        result = "/".to_string();
+    }
+    if trailing_slash && !result.ends_with('/') {
+        result.push('/');
+    }
+    result
 }
 
 fn parse_authority(authority: &str, default_port: u16, original: &str) -> Result<(String, u16)> {
@@ -195,5 +297,60 @@ mod tests {
         let u = Url::parse("http://example.com/search?existing=1").unwrap();
         let u = u.with_query_pairs([("q", "hello world"), ("n", "1")]);
         assert_eq!(u.query.as_deref(), Some("existing=1&q=hello%20world&n=1"));
+    }
+
+    #[test]
+    fn resolves_absolute_location() {
+        let base = Url::parse("http://example.com/a/b").unwrap();
+        let resolved = base.resolve_redirect("http://other.com/c").unwrap();
+        assert_eq!(resolved.host, "other.com");
+        assert_eq!(resolved.path, "/c");
+    }
+
+    #[test]
+    fn resolves_protocol_relative_location() {
+        let base = Url::parse("http://example.com/a").unwrap();
+        let resolved = base.resolve_redirect("//other.com/c").unwrap();
+        assert_eq!(resolved.scheme, "http");
+        assert_eq!(resolved.host, "other.com");
+        assert_eq!(resolved.path, "/c");
+    }
+
+    #[test]
+    fn resolves_absolute_path_location() {
+        let base = Url::parse("http://example.com:8080/a/b?old=1").unwrap();
+        let resolved = base.resolve_redirect("/c/d").unwrap();
+        assert_eq!(resolved.host, "example.com");
+        assert_eq!(resolved.port, 8080);
+        assert_eq!(resolved.path, "/c/d");
+        assert_eq!(resolved.query, None);
+    }
+
+    #[test]
+    fn resolves_relative_path_location_against_directory() {
+        let base = Url::parse("http://example.com/a/b/c").unwrap();
+        let resolved = base.resolve_redirect("d").unwrap();
+        assert_eq!(resolved.path, "/a/b/d");
+    }
+
+    #[test]
+    fn resolves_relative_path_with_dot_segments() {
+        let base = Url::parse("http://example.com/a/b/c").unwrap();
+        let resolved = base.resolve_redirect("../x").unwrap();
+        assert_eq!(resolved.path, "/a/x");
+    }
+
+    #[test]
+    fn resolves_query_only_location_keeping_path() {
+        let base = Url::parse("http://example.com/a/b?old=1").unwrap();
+        let resolved = base.resolve_redirect("?new=2").unwrap();
+        assert_eq!(resolved.path, "/a/b");
+        assert_eq!(resolved.query.as_deref(), Some("new=2"));
+    }
+
+    #[test]
+    fn rejects_empty_location() {
+        let base = Url::parse("http://example.com/a").unwrap();
+        assert!(base.resolve_redirect("").is_err());
     }
 }

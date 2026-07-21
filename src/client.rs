@@ -12,7 +12,18 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_REDIRECTS: usize = 30;
 const USER_AGENT: &str = concat!("rusty_request/", env!("CARGO_PKG_VERSION"));
+
+/// How a redirect (3xx `Location`) response should be handled.
+/// `Follow(n)` chases up to `n` hops before returning
+/// [`Error::TooManyRedirects`]; `None` returns the raw 3xx response
+/// immediately, matching `requests`' `allow_redirects=False`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectPolicy {
+    Follow(usize),
+    None,
+}
 
 /// A reusable request configuration: default headers applied to every
 /// request built from it, plus a default timeout. Cheap to `Clone`
@@ -23,6 +34,7 @@ const USER_AGENT: &str = concat!("rusty_request/", env!("CARGO_PKG_VERSION"));
 pub struct Client {
     default_headers: HeaderMap,
     timeout: Option<Duration>,
+    redirect_policy: RedirectPolicy,
 }
 
 impl Client {
@@ -42,6 +54,7 @@ impl Client {
             headers: self.default_headers.clone(),
             body: Body::Empty,
             timeout: self.timeout,
+            redirect_policy: self.redirect_policy,
         })
     }
 
@@ -79,6 +92,7 @@ impl Default for Client {
 pub struct ClientBuilder {
     default_headers: HeaderMap,
     timeout: Option<Duration>,
+    redirect_policy: RedirectPolicy,
 }
 
 impl ClientBuilder {
@@ -90,6 +104,7 @@ impl ClientBuilder {
         ClientBuilder {
             default_headers,
             timeout: Some(DEFAULT_TIMEOUT),
+            redirect_policy: RedirectPolicy::Follow(DEFAULT_MAX_REDIRECTS),
         }
     }
 
@@ -132,10 +147,29 @@ impl ClientBuilder {
         self
     }
 
+    /// Caps how many redirect hops are followed before a request fails
+    /// with [`Error::TooManyRedirects`] (default 30, matching
+    /// `requests`). Set to `0` to require the very first response to be
+    /// non-redirect. See also [`ClientBuilder::no_redirects`] to skip
+    /// following entirely.
+    pub fn max_redirects(mut self, max: usize) -> Self {
+        self.redirect_policy = RedirectPolicy::Follow(max);
+        self
+    }
+
+    /// Never follows redirects -- every request built from the
+    /// resulting [`Client`] returns the raw 3xx response instead,
+    /// matching `requests`' `allow_redirects=False`.
+    pub fn no_redirects(mut self) -> Self {
+        self.redirect_policy = RedirectPolicy::None;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
             timeout: self.timeout,
+            redirect_policy: self.redirect_policy,
         }
     }
 }
@@ -152,6 +186,7 @@ pub struct RequestBuilder {
     headers: HeaderMap,
     body: Body,
     timeout: Option<Duration>,
+    redirect_policy: RedirectPolicy,
 }
 
 impl RequestBuilder {
@@ -234,44 +269,136 @@ impl RequestBuilder {
         self
     }
 
+    /// Caps how many redirect hops this request follows before failing
+    /// with [`Error::TooManyRedirects`], overriding the `Client`'s
+    /// default. See [`ClientBuilder::max_redirects`].
+    pub fn max_redirects(mut self, max: usize) -> Self {
+        self.redirect_policy = RedirectPolicy::Follow(max);
+        self
+    }
+
+    /// Never follows redirects for this request -- returns the raw 3xx
+    /// response instead, overriding the `Client`'s default. See
+    /// [`ClientBuilder::no_redirects`].
+    pub fn no_redirects(mut self) -> Self {
+        self.redirect_policy = RedirectPolicy::None;
+        self
+    }
+
     pub async fn send(self) -> Result<Response> {
         let RequestBuilder {
             method,
             url,
-            mut headers,
-            body,
-            timeout: request_timeout,
-        } = self;
-
-        if url.scheme != "http" {
-            return Err(Error::UnsupportedScheme(url.scheme));
-        }
-
-        if !headers.contains("Accept") {
-            headers.insert("Accept", "*/*")?;
-        }
-        // No connection reuse in this MVP (see the backlog), so every
-        // request is honest about that on the wire too.
-        headers.insert("Connection", "close")?;
-        // Always computed from the real body, never trusted from a
-        // caller-supplied header.
-        headers.insert("Content-Length", &body.as_bytes().len().to_string())?;
-
-        let request = Request {
-            method,
-            url: url.clone(),
             headers,
             body,
             timeout: request_timeout,
-        };
+            redirect_policy,
+        } = self;
 
-        let fut = send_over_new_connection(&request);
+        let fut = send_with_redirects(method, url, headers, body, redirect_policy);
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
                 Ok(inner) => inner,
                 Err(_elapsed) => Err(Error::Timeout),
             },
             None => fut.await,
+        }
+    }
+}
+
+/// Sends the request, following redirects per `policy`. The overall
+/// timeout (if any) wraps this whole chain, not each individual hop --
+/// otherwise a slow redirect chain could add hops to dodge it.
+async fn send_with_redirects(
+    mut method: Method,
+    mut url: Url,
+    headers: HeaderMap,
+    mut body: Body,
+    policy: RedirectPolicy,
+) -> Result<Response> {
+    let mut hop_headers = headers;
+    let mut hop = 0usize;
+
+    loop {
+        if url.scheme != "http" {
+            return Err(Error::UnsupportedScheme(url.scheme));
+        }
+
+        let mut wire_headers = hop_headers.clone();
+        if !wire_headers.contains("Accept") {
+            wire_headers.insert("Accept", "*/*")?;
+        }
+        // No connection reuse in this MVP (see the backlog), so every
+        // request is honest about that on the wire too.
+        wire_headers.insert("Connection", "close")?;
+        // Always computed from the real body, never trusted from a
+        // caller-supplied header.
+        wire_headers.insert("Content-Length", &body.as_bytes().len().to_string())?;
+
+        let request = Request {
+            method,
+            url: url.clone(),
+            headers: wire_headers,
+            body: body.clone(),
+            timeout: None,
+        };
+        let response = send_over_new_connection(&request).await?;
+
+        if !is_redirect_status(response.status().as_u16()) {
+            return Ok(response);
+        }
+        let RedirectPolicy::Follow(max) = policy else {
+            return Ok(response);
+        };
+        if hop >= max {
+            return Err(Error::TooManyRedirects(max));
+        }
+
+        let location = response
+            .headers()
+            .get("location")
+            .ok_or_else(|| {
+                Error::InvalidResponse(format!(
+                    "{} redirect response had no Location header",
+                    response.status()
+                ))
+            })?
+            .to_string();
+        let next_url = url.resolve_redirect(&location)?;
+
+        // A redirect to a different host/port must not carry credentials
+        // meant for the original origin along with it (the same class of
+        // leak `requests` itself fixed after CVE-2018-18074).
+        let cross_origin =
+            !next_url.host.eq_ignore_ascii_case(&url.host) || next_url.port != url.port;
+        if cross_origin {
+            hop_headers.remove("Authorization");
+        }
+
+        (method, body) = redirect_method_and_body(response.status().as_u16(), method, body);
+        url = next_url;
+        hop += 1;
+    }
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Per RFC 9110 §15.4: 303 always downgrades to a bodyless GET; 307/308
+/// always preserve the original method and body; 301/302 are spec-loose
+/// but conventionally (browsers, `requests`) downgrade to a bodyless GET
+/// for any method other than GET/HEAD, which are left as-is.
+fn redirect_method_and_body(status: u16, method: Method, body: Body) -> (Method, Body) {
+    match status {
+        303 => (Method::Get, Body::Empty),
+        307 | 308 => (method, body),
+        _ => {
+            if matches!(method, Method::Get | Method::Head) {
+                (method, body)
+            } else {
+                (Method::Get, Body::Empty)
+            }
         }
     }
 }
