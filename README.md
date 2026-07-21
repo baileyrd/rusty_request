@@ -23,10 +23,12 @@ not silently unsupported or half-implemented.
 
 - **Methods**: GET, POST, PUT, PATCH, DELETE, HEAD.
 - **Client + top-level functions**: `rusty_request::get(url).await?` for
-  one-off calls, or build a `Client` to share default headers and a
-  timeout across requests (mirrors `requests`' module-level functions +
-  `Session` split -- though unlike `Session`, this `Client` does not yet
-  persist cookies or reuse connections; see the backlog).
+  one-off calls, or build a `Client` to share default headers, a
+  timeout, and cookies across requests (mirrors `requests`' module-level
+  functions + `Session` split). Cloning a `Client` shares the same
+  underlying cookie jar -- it's the same logical session, not an
+  independent copy. Unlike `Session`, this does not yet reuse TCP
+  connections; see the backlog.
 - **Requests**: custom headers, query parameters (percent-encoded),
   string/bytes/JSON/form-urlencoded bodies, per-request or per-client
   timeouts.
@@ -47,6 +49,16 @@ not silently unsupported or half-implemented.
   use, since the spec itself is looser. `Authorization` is stripped on
   any hop that changes host or port, so credentials never leak to a
   different origin.
+- **Cookies**: every `Client` stores `Set-Cookie` responses and attaches
+  matching cookies to later requests (RFC 6265 domain/path scoping,
+  `Expires`/`Max-Age` expiry, `Secure`), including across redirect hops
+  within one call -- the same default behavior `requests.Session` gives
+  you. `Secure` cookies are never attached, since this crate is
+  `http://`-only. `ClientBuilder::no_cookie_store()` disables cookie
+  handling entirely for a client that shouldn't carry state. No
+  public-suffix-list support -- the only cross-domain safety check is
+  RFC 6265's own "a response may only set a `Domain` that's a suffix of
+  the host that sent it," not full supercookie prevention.
 - **HTTP/1.1 framing**: `Content-Length` and `Transfer-Encoding: chunked`
   response bodies, plus close-delimited (EOF-terminated) bodies as a
   fallback. No connection reuse -- every request opens a fresh TCP
@@ -104,9 +116,6 @@ Tracked as issues in this repository:
 - **HTTPS/TLS support** -- needs a dedicated, carefully-reviewed effort
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
-- **`Session`-style cookie jar** -- persisting cookies across requests
-  made with the same `Client` (and, once it exists, across redirect
-  hops too).
 - **Multipart file uploads**.
 - **Retry/backoff**.
 - **Streaming request and response bodies** -- everything is fully

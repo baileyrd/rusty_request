@@ -22,16 +22,21 @@
 //!   method/body-preservation rules RFC 9110 §15.4 and browsers/
 //!   `requests` actually use, and `Authorization` stripped on any
 //!   cross-origin hop.
+//! - Cookies: every `Client` stores `Set-Cookie` responses (RFC 6265 --
+//!   domain/path scoping, `Expires`/`Max-Age` expiry, `Secure`) and
+//!   attaches matching cookies to later requests through the same
+//!   `Client`, including across redirect hops -- the same behavior
+//!   `requests.Session` gives by default. `ClientBuilder::no_cookie_store`
+//!   opts out.
 //! - `http://` only. **No HTTPS/TLS** -- hand-rolling TLS crypto is a
 //!   serious security risk to improvise in an MVP; see the README and
 //!   issue tracker for the tracked follow-up.
 //! - A fresh TCP connection per request (`Connection: close`) -- no
 //!   connection pooling/keep-alive yet.
 //!
-//! Everything else (a `Session`-style cookie jar, multipart uploads,
-//! retries, streaming bodies, proxies, connection reuse) is
-//! deliberately deferred -- see the README's backlog section and the
-//! repository's issue tracker.
+//! Everything else (multipart uploads, retries, streaming bodies,
+//! proxies, connection reuse) is deliberately deferred -- see the
+//! README's backlog section and the repository's issue tracker.
 //!
 //! # Example
 //!
@@ -47,6 +52,7 @@
 mod base64;
 mod body;
 mod client;
+mod cookie;
 mod error;
 mod header;
 mod http1;

@@ -1,4 +1,5 @@
 use crate::body::Body;
+use crate::cookie::CookieJar;
 use crate::error::{Error, Result};
 use crate::header::HeaderMap;
 use crate::http1;
@@ -9,6 +10,7 @@ use crate::response::Response;
 use crate::url::{percent_encode, Url};
 use rusty_tokio::io::TcpStream;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,16 +27,19 @@ enum RedirectPolicy {
     None,
 }
 
-/// A reusable request configuration: default headers applied to every
-/// request built from it, plus a default timeout. Cheap to `Clone`
-/// (headers aside, everything else is `Copy`) -- unlike Python
-/// `requests.Session`, this does **not** yet persist cookies or reuse
-/// TCP connections across requests (see the backlog).
+/// A reusable request configuration: default headers, a default
+/// timeout, and (by default) a shared cookie jar, applied to every
+/// request built from it. Cheap to `Clone` -- every clone shares the
+/// same underlying cookie jar (an `Arc<Mutex<_>>`), matching Python
+/// `requests.Session` semantics: it's the same logical session, not an
+/// independent copy. Unlike `Session`, this does **not** yet reuse TCP
+/// connections across requests (see the backlog).
 #[derive(Debug, Clone)]
 pub struct Client {
     default_headers: HeaderMap,
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 }
 
 impl Client {
@@ -55,6 +60,7 @@ impl Client {
             body: Body::Empty,
             timeout: self.timeout,
             redirect_policy: self.redirect_policy,
+            cookie_jar: self.cookie_jar.clone(),
         })
     }
 
@@ -93,6 +99,7 @@ pub struct ClientBuilder {
     default_headers: HeaderMap,
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 }
 
 impl ClientBuilder {
@@ -105,6 +112,7 @@ impl ClientBuilder {
             default_headers,
             timeout: Some(DEFAULT_TIMEOUT),
             redirect_policy: RedirectPolicy::Follow(DEFAULT_MAX_REDIRECTS),
+            cookie_jar: Some(Arc::new(Mutex::new(CookieJar::new()))),
         }
     }
 
@@ -165,11 +173,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Disables cookie storage entirely -- by default every [`Client`]
+    /// stores `Set-Cookie` responses and attaches matching cookies to
+    /// later requests (RFC 6265), the same as `requests.Session`. Call
+    /// this for a client that should never carry state between requests.
+    pub fn no_cookie_store(mut self) -> Self {
+        self.cookie_jar = None;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
             timeout: self.timeout,
             redirect_policy: self.redirect_policy,
+            cookie_jar: self.cookie_jar,
         }
     }
 }
@@ -187,6 +205,7 @@ pub struct RequestBuilder {
     body: Body,
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 }
 
 impl RequestBuilder {
@@ -293,9 +312,10 @@ impl RequestBuilder {
             body,
             timeout: request_timeout,
             redirect_policy,
+            cookie_jar,
         } = self;
 
-        let fut = send_with_redirects(method, url, headers, body, redirect_policy);
+        let fut = send_with_redirects(method, url, headers, body, redirect_policy, cookie_jar);
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
                 Ok(inner) => inner,
@@ -315,6 +335,7 @@ async fn send_with_redirects(
     headers: HeaderMap,
     mut body: Body,
     policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 ) -> Result<Response> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -327,6 +348,20 @@ async fn send_with_redirects(
         let mut wire_headers = hop_headers.clone();
         if !wire_headers.contains("Accept") {
             wire_headers.insert("Accept", "*/*")?;
+        }
+        // Attach any cookies the jar has for this origin/path, merging
+        // with (rather than overriding) a caller-set `Cookie` header.
+        // Looked up fresh every hop since the jar's contents can change
+        // between hops (a redirect response can itself set cookies).
+        if let Some(jar) = &cookie_jar {
+            let jar_cookies = jar.lock().unwrap().cookie_header_for(&url);
+            if let Some(jar_cookies) = jar_cookies {
+                let merged = match wire_headers.get("Cookie") {
+                    Some(existing) => format!("{existing}; {jar_cookies}"),
+                    None => jar_cookies,
+                };
+                wire_headers.insert("Cookie", &merged)?;
+            }
         }
         // No connection reuse in this MVP (see the backlog), so every
         // request is honest about that on the wire too.
@@ -343,6 +378,24 @@ async fn send_with_redirects(
             timeout: None,
         };
         let response = send_over_new_connection(&request).await?;
+
+        // Store cookies from every hop's response, not just the final
+        // one -- an intermediate redirect can set cookies too, and they
+        // should be available both to later hops of this same chain and
+        // to future requests through this `Client`.
+        if let Some(jar) = &cookie_jar {
+            let set_cookie_values: Vec<&str> = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, value)| value)
+                .collect();
+            if !set_cookie_values.is_empty() {
+                jar.lock()
+                    .unwrap()
+                    .store_from_response(&url, set_cookie_values.into_iter());
+            }
+        }
 
         if !is_redirect_status(response.status().as_u16()) {
             return Ok(response);
