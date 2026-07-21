@@ -465,13 +465,15 @@ fn request_times_out_when_the_server_never_responds() {
 }
 
 #[test]
-fn unsupported_scheme_is_rejected_before_connecting() {
+fn unrecognized_scheme_is_rejected_before_connecting() {
+    // https:// used to be the scheme this test rejected -- now that TLS
+    // support has landed, http:// and https:// both proceed (a real
+    // https:// round trip is covered by tests/https.rs). A genuinely
+    // unrecognized scheme is still rejected, at `Url::parse`, before any
+    // network I/O.
     run(async {
-        let result = rusty_request::get("https://example.com/").await;
-        match result {
-            Err(Error::UnsupportedScheme(scheme)) => assert_eq!(scheme, "https"),
-            other => panic!("expected Error::UnsupportedScheme, got {other:?}"),
-        }
+        let result = rusty_request::get("ftp://example.com/").await;
+        assert!(matches!(result, Err(Error::InvalidUrl(_))));
     });
 }
 

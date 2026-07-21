@@ -3,21 +3,19 @@
 An async, hand-rolled HTTP client for Rust -- a take on Python's
 `requests`, built on our own from-scratch async runtime
 ([`rusty_tokio`](https://github.com/baileyrd/rusty_tokio)) instead of
-`tokio`. `rusty_tokio` is the only dependency. Everything above the raw
-socket -- URL parsing, HTTP/1.1 request/response framing, JSON -- is
-original code in this crate: no `hyper`, no `reqwest`, no `serde`, no
-`url` crate.
+`tokio`. Everything above the raw socket -- URL parsing, HTTP/1.1
+request/response framing, JSON -- is original code in this crate: no
+`hyper`, no `reqwest`, no `serde`, no `url` crate.
 
-## Why no TLS/HTTPS
+## TLS/HTTPS
 
-Hand-rolling real TLS (cipher suites, certificate validation, key
-exchange) is a serious cryptography undertaking, and a real security
-risk if done wrong -- not something to improvise into an HTTP client
-MVP. [`rustils`](https://github.com/baileyrd/rustils) (the platform
-layer `rusty_tokio` itself is built on) is explicit that it has "no TLS
-concept anywhere in any slice" today. So this crate is **`http://`
-only** for now; HTTPS is tracked as a real backlog item (see below),
-not silently unsupported or half-implemented.
+`https://` is supported, via
+[`rusty_tls`](https://github.com/baileyrd/rusty_tls) -- the ecosystem's
+one shared TLS implementation and trust policy, not anything hand-rolled
+here. Every `https://` request is verified by default against the system
+trust store, with SNI from the URL host; this crate has no public API to
+configure a different trust policy today. TLS 1.2/1.3, no ALPN (this
+crate is HTTP/1.1-only), no client certificates.
 
 ## What's here (MVP)
 
@@ -57,7 +55,8 @@ not silently unsupported or half-implemented.
   handling entirely for a client that shouldn't carry state. No
   public-suffix-list support -- the only cross-domain safety check is
   RFC 6265's own "a response may only set a `Domain` that's a suffix of
-  the host that sent it," not full supercookie prevention.
+  the host that sent it," not full supercookie prevention. `Secure`
+  cookies are attached only over `https://`.
 - **HTTP/1.1 framing**: `Content-Length` and `Transfer-Encoding: chunked`
   response bodies, plus close-delimited (EOF-terminated) bodies as a
   fallback.
@@ -109,22 +108,25 @@ not silently unsupported or half-implemented.
   configured `RetryPolicy` is ignored, and the connection used isn't
   returned to the pool afterward.
 - **Proxy support**: `.proxy("http://host:port")` on `ClientBuilder`/
-  `RequestBuilder` routes plain `http://` requests through an HTTP
-  forward proxy (absolute-form request-target, `Host` still naming the
-  origin) instead of connecting to the origin directly.
-  `.proxy_from_env()` reads `HTTP_PROXY`/`http_proxy` and `NO_PROXY`/
-  `no_proxy`, matching `requests`' convention -- with an
-  ["httpoxy"](https://httpoxy.org) mitigation: `HTTP_PROXY` is ignored
-  whenever `REQUEST_METHOD` is also set (the standard CGI-context
-  signal), since a CGI/FastCGI handler can map an inbound `Proxy:`
-  header onto that variable. `.proxy_bypass(hosts)` sets `NO_PROXY`-style
-  bypass rules (exact host or subdomain match, or `*` for "never proxy
-  anything"). A proxy connection is pooled under the proxy's own
-  identity rather than the origin's, so one persistent connection can
-  carry requests for several different origins. `CONNECT`-tunnel
-  proxying (for eventual HTTPS) is deferred until TLS lands -- this
-  crate is `http://`-only end to end today, so plain forwarding is all
-  there is to build.
+  `RequestBuilder` routes requests through an HTTP forward proxy instead
+  of connecting to the origin directly -- reached over plain `http://`
+  either way (an `https://` proxy URL is rejected). An `http://` request
+  is forwarded in cleartext (absolute-form request-target, `Host` still
+  naming the origin); an `https://` request instead opens a `CONNECT`
+  tunnel to the origin and runs the TLS handshake and the real request
+  through it, invisible to the proxy. `.proxy_from_env()` reads
+  `HTTP_PROXY`/`http_proxy` and `NO_PROXY`/`no_proxy`, matching
+  `requests`' convention -- with an ["httpoxy"](https://httpoxy.org)
+  mitigation: `HTTP_PROXY` is ignored whenever `REQUEST_METHOD` is also
+  set (the standard CGI-context signal), since a CGI/FastCGI handler can
+  map an inbound `Proxy:` header onto that variable. `.proxy_bypass(hosts)`
+  sets `NO_PROXY`-style bypass rules (exact host or subdomain match, or
+  `*` for "never proxy anything"). A plain `http://` proxy connection is
+  pooled under the proxy's own identity, so one persistent connection can
+  carry requests for several different origins; a `CONNECT`-tunneled
+  `https://` connection is pooled under a key specific to that (proxy,
+  origin) pair instead, since the tunnel itself is a private,
+  origin-specific channel once established.
 
 ## Example
 
@@ -172,18 +174,21 @@ async fn main() -> rusty_request::Result<()> {
 
 Tracked as issues in this repository:
 
-- **HTTPS/TLS support** -- needs a dedicated, carefully-reviewed effort
-  (likely a `rustils` Security-surface addition, or FFI into an OS TLS
-  library), not something bolted on here.
+- **A configurable TLS trust policy.** Every `https://` request uses
+  `rusty_tls::TrustPolicy::System` today; there's no way to pin a
+  private CA or opt into `DangerNoVerification` from this crate's own
+  API.
+- **HTTP/2 / ALPN.** This crate is HTTP/1.1-only.
 
 ## Testing
 
 ```
 cargo build
 cargo test           # unit tests (url/header/json parsing) plus
-                      # integration tests against a local hand-rolled
-                      # HTTP/1.1 server (tests/common), so nothing
-                      # requires real network access
+                      # integration tests against local hand-rolled
+                      # HTTP/1.1 servers (tests/common) -- including a
+                      # TLS one and a CONNECT-tunneling proxy one -- so
+                      # nothing requires real network access
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

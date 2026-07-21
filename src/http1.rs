@@ -1,7 +1,7 @@
 //! HTTP/1.1 wire framing: request-head serialization and response
 //! parsing (status line, headers, and body -- `Content-Length`,
 //! `Transfer-Encoding: chunked`, or close-delimited as a last resort)
-//! over a `rusty_tokio` [`TcpStream`]. Close-delimited bodies (no
+//! over a [`Conn`] (plain TCP or TLS). Close-delimited bodies (no
 //! `Content-Length`, no chunked encoding -- legal in HTTP/1.0-flavored
 //! responses) are read to EOF rather than treated as an error; doing so
 //! also means the stream can never be pooled afterward (see
@@ -15,7 +15,7 @@
 //! [`crate::RequestBuilder::send_streaming`]) returns as soon as the
 //! status line and headers are parsed, leaving the body to be pulled
 //! incrementally via [`StreamingBody::next_chunk`]. Both need to own the
-//! `TcpStream` (not just borrow it) -- the streaming path so it can keep
+//! [`Conn`] (not just borrow it) -- the streaming path so it can keep
 //! reading from it after this module's functions return, and the
 //! buffered path so it can hand the same connection back to the caller
 //! afterward for pooling (`RawResponse::stream`).
@@ -25,7 +25,8 @@ use crate::error::{Error, Result};
 use crate::header::HeaderMap;
 use crate::method::Method;
 use crate::status::StatusCode;
-use rusty_tokio::io::{AsyncReadExt, TcpStream};
+use crate::stream::Conn;
+use rusty_tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A line (status line, header line, chunk-size line, ...) that never
 /// arrived can't grow the read buffer forever -- this bounds it.
@@ -50,7 +51,7 @@ pub(crate) struct RawResponse {
     /// Handed back so the caller can pool it (when `keep_alive`) --
     /// reading the response moved ownership of the connection into this
     /// module, so it has to come back out somehow.
-    pub stream: TcpStream,
+    pub stream: Conn,
 }
 
 pub(crate) struct StreamingRawResponse {
@@ -62,14 +63,22 @@ pub(crate) struct StreamingRawResponse {
 }
 
 pub(crate) async fn send_request(
-    stream: TcpStream,
+    mut stream: Conn,
     method: Method,
     request_target: &str,
     host_header: &str,
     headers: &HeaderMap,
     body: &Body,
 ) -> Result<RawResponse> {
-    write_request(&stream, method, request_target, host_header, headers, body).await?;
+    write_request(
+        &mut stream,
+        method,
+        request_target,
+        host_header,
+        headers,
+        body,
+    )
+    .await?;
     let (status, reason, resp_headers, mut reader) = read_head(stream).await?;
     let framing = framing_for(&resp_headers, method, status)?;
     let (body, framing_reusable) = drain_body(&mut reader, framing).await?;
@@ -93,14 +102,22 @@ pub(crate) async fn send_request(
 /// docs); it's simply dropped (closing the socket) once the
 /// `StreamingBody` -- or whatever's holding it -- goes out of scope.
 pub(crate) async fn send_request_streaming(
-    stream: TcpStream,
+    mut stream: Conn,
     method: Method,
     request_target: &str,
     host_header: &str,
     headers: &HeaderMap,
     body: &Body,
 ) -> Result<StreamingRawResponse> {
-    write_request(&stream, method, request_target, host_header, headers, body).await?;
+    write_request(
+        &mut stream,
+        method,
+        request_target,
+        host_header,
+        headers,
+        body,
+    )
+    .await?;
     let (status, reason, resp_headers, reader) = read_head(stream).await?;
     let framing = framing_for(&resp_headers, method, status)?;
     let done = matches!(framing, Framing::None);
@@ -119,7 +136,7 @@ pub(crate) async fn send_request_streaming(
 }
 
 async fn write_request(
-    stream: &TcpStream,
+    stream: &mut Conn,
     method: Method,
     request_target: &str,
     host_header: &str,
@@ -158,7 +175,7 @@ async fn write_request(
 /// Relays a streaming request body onto the wire: raw passthrough when
 /// its length was declared upfront (`Content-Length` already covers
 /// framing), or `Transfer-Encoding: chunked` framing when it wasn't.
-async fn write_stream_body(stream: &TcpStream, body: &crate::body::StreamBody) -> Result<()> {
+async fn write_stream_body(stream: &mut Conn, body: &crate::body::StreamBody) -> Result<()> {
     let mut reader = body.open();
     let known_length = body.len().is_some();
     let mut buf = [0u8; CHUNK_SIZE];
@@ -186,7 +203,7 @@ async fn write_stream_body(stream: &TcpStream, body: &crate::body::StreamBody) -
 /// ends the headers, owning whatever body bytes it's already buffered)
 /// so a caller can continue reading the body from the same place --
 /// either eagerly ([`drain_body`]) or incrementally ([`StreamingBody`]).
-async fn read_head(stream: TcpStream) -> Result<(StatusCode, String, HeaderMap, BufReader)> {
+async fn read_head(stream: Conn) -> Result<(StatusCode, String, HeaderMap, BufReader)> {
     let mut reader = BufReader::new(stream);
 
     let status_line = reader
@@ -468,7 +485,7 @@ fn parse_header_line(line: &str) -> Result<(String, String)> {
     Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
-/// A small buffered reader that owns its [`TcpStream`]. Needed because
+/// A small buffered reader that owns its [`Conn`]. Needed because
 /// header lines have to be read byte-by-byte-ish (scanning for `\n`)
 /// while the socket itself has no internal buffering -- and because
 /// scanning ahead for a line terminator can read past it into body
@@ -491,7 +508,7 @@ fn parse_header_line(line: &str) -> Result<(String, String)> {
 /// same reader across a response" design here (and the streaming path's
 /// "never pooled" simplification) would need revisiting.
 struct BufReader {
-    stream: TcpStream,
+    stream: Conn,
     buf: Vec<u8>,
     /// `buf[start..end]` is the unread, already-received data.
     start: usize,
@@ -499,7 +516,7 @@ struct BufReader {
 }
 
 impl BufReader {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: Conn) -> Self {
         BufReader {
             stream,
             buf: vec![0u8; 8192],
@@ -508,7 +525,7 @@ impl BufReader {
         }
     }
 
-    fn into_stream(self) -> TcpStream {
+    fn into_stream(self) -> Conn {
         self.stream
     }
 
