@@ -357,3 +357,166 @@ fn client_level_bearer_auth_applies_to_every_request() {
             .unwrap();
     });
 }
+
+#[test]
+fn redirect_301_get_is_followed() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/start" => http_response(301, "Moved Permanently", &[("Location", "/end")], b""),
+            "/end" => http_response(200, "OK", &[], b"final"),
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let resp = rusty_request::get(&server.url("/start")).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text().unwrap(), "final");
+        assert_eq!(resp.url().path, "/end");
+    });
+}
+
+#[test]
+fn redirect_303_downgrades_post_to_bodyless_get() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/start" => {
+                assert_eq!(req.method, "POST");
+                http_response(303, "See Other", &[("Location", "/end")], b"")
+            }
+            "/end" => {
+                assert_eq!(req.method, "GET");
+                assert!(req.body.is_empty());
+                http_response(200, "OK", &[], b"ok")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let resp = Client::new()
+            .post(&server.url("/start"))
+            .unwrap()
+            .body("original payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn redirect_301_downgrades_non_get_head_to_bodyless_get() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/start" => {
+                assert_eq!(req.method, "POST");
+                http_response(301, "Moved Permanently", &[("Location", "/end")], b"")
+            }
+            "/end" => {
+                assert_eq!(req.method, "GET");
+                assert!(req.body.is_empty());
+                http_response(200, "OK", &[], b"ok")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        Client::new()
+            .post(&server.url("/start"))
+            .unwrap()
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn redirect_307_preserves_method_and_body() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/start" => {
+                assert_eq!(req.method, "POST");
+                http_response(307, "Temporary Redirect", &[("Location", "/end")], b"")
+            }
+            "/end" => {
+                assert_eq!(req.method, "POST");
+                assert_eq!(req.body, b"payload");
+                http_response(200, "OK", &[], b"ok")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        Client::new()
+            .post(&server.url("/start"))
+            .unwrap()
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn too_many_redirects_returns_error() {
+    run(async {
+        let server =
+            start_test_server(|_req| http_response(302, "Found", &[("Location", "/loop")], b""));
+
+        let result = Client::new()
+            .get(&server.url("/loop"))
+            .unwrap()
+            .max_redirects(3)
+            .send()
+            .await;
+
+        match result {
+            Err(Error::TooManyRedirects(3)) => {}
+            other => panic!("expected Error::TooManyRedirects(3), got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn no_redirects_returns_the_raw_3xx_response() {
+    run(async {
+        let server =
+            start_test_server(|_req| http_response(302, "Found", &[("Location", "/end")], b""));
+
+        let resp = Client::new()
+            .get(&server.url("/start"))
+            .unwrap()
+            .no_redirects()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(resp.headers().get("location"), Some("/end"));
+    });
+}
+
+#[test]
+fn cross_origin_redirect_strips_authorization_header() {
+    run(async {
+        let target = start_test_server(|req| {
+            assert_eq!(req.header("authorization"), None);
+            http_response(200, "OK", &[], b"ok")
+        });
+        let target_url = target.url("/end");
+
+        let entry = start_test_server(move |req| {
+            assert_eq!(
+                req.header("authorization"),
+                Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+            );
+            http_response(302, "Found", &[("Location", target_url.as_str())], b"")
+        });
+
+        let resp = Client::new()
+            .get(&entry.url("/start"))
+            .unwrap()
+            .basic_auth("Aladdin", "open sesame")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
