@@ -1,11 +1,12 @@
 //! HTTP/1.1 wire framing: request-head serialization and response
 //! parsing (status line, headers, and body -- `Content-Length`,
 //! `Transfer-Encoding: chunked`, or close-delimited as a last resort)
-//! over a `rusty_tokio` [`TcpStream`]. No keep-alive in this MVP: every
-//! request opens a fresh connection and sends `Connection: close`, so
-//! close-delimited bodies (no `Content-Length`, no chunked encoding --
-//! legal in HTTP/1.0-flavored responses) are read to EOF rather than
-//! treated as an error.
+//! over a `rusty_tokio` [`TcpStream`]. Close-delimited bodies (no
+//! `Content-Length`, no chunked encoding -- legal in HTTP/1.0-flavored
+//! responses) are read to EOF rather than treated as an error; doing so
+//! also means the stream can never be pooled afterward (see
+//! `RawResponse::keep_alive` and `crate::pool`), since reaching EOF is
+//! exactly the peer having already closed it.
 
 use crate::error::{Error, Result};
 use crate::header::HeaderMap;
@@ -23,6 +24,11 @@ pub(crate) struct RawResponse {
     pub reason: String,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    /// Whether `stream` is still usable for another request after this
+    /// response: the body framing left the stream in a known-clean
+    /// state (i.e. wasn't read-to-EOF) *and* the response didn't send
+    /// `Connection: close`.
+    pub keep_alive: bool,
 }
 
 pub(crate) async fn send_request(
@@ -74,22 +80,47 @@ pub(crate) async fn send_request(
         resp_headers.append(&name, &value)?;
     }
 
-    let body = read_body(&mut reader, &resp_headers, method, status).await?;
+    let (body, framing_reusable) = read_body(&mut reader, &resp_headers, method, status).await?;
+
+    // A `Connection` header can list multiple tokens
+    // (`Connection: keep-alive, Upgrade`); `close` anywhere in the list
+    // means the peer is closing the connection after this response.
+    let header_says_close = resp_headers
+        .get("connection")
+        .map(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+        })
+        .unwrap_or(false);
 
     Ok(RawResponse {
         status,
         reason,
         headers: resp_headers,
         body,
+        keep_alive: framing_reusable && !header_says_close,
     })
 }
 
+/// Reads the response body, returning it alongside whether `reader`'s
+/// underlying stream is still in a known-clean state afterward (i.e.
+/// safe to send another request on, framing-wise -- a caller still
+/// needs to check the `Connection` header too, which this function
+/// doesn't see).
+///
+/// This is only sound because this crate never pipelines: a caller
+/// always awaits a full response before sending its next request on
+/// the same stream, so a server never has a reason to send more than
+/// one response's worth of bytes before that next request arrives. If
+/// that ever changes, the "fresh `BufReader` per call, no carryover"
+/// design this relies on would need to carry buffered-but-unconsumed
+/// bytes forward between calls instead of discarding them.
 async fn read_body(
     reader: &mut BufReader<'_>,
     headers: &HeaderMap,
     method: Method,
     status: StatusCode,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     // RFC 7230 §3.3.3: these never carry a body regardless of what the
     // headers claim.
     if method == Method::Head
@@ -97,7 +128,7 @@ async fn read_body(
         || status.as_u16() == 304
         || (100..200).contains(&status.as_u16())
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
     let is_chunked = headers
@@ -112,7 +143,7 @@ async fn read_body(
         .unwrap_or(false);
 
     if is_chunked {
-        return read_chunked_body(reader).await;
+        return Ok((read_chunked_body(reader).await?, true));
     }
 
     if let Some(len) = headers.get("content-length") {
@@ -120,13 +151,14 @@ async fn read_body(
             .trim()
             .parse()
             .map_err(|_| Error::InvalidResponse(format!("invalid Content-Length `{len}`")))?;
-        return reader.read_exact_n(len).await;
+        return Ok((reader.read_exact_n(len).await?, true));
     }
 
     // No framing header at all: close-delimited body, read to EOF.
-    // Legal for an HTTP/1.0-style response and harmless here since this
-    // MVP never reuses a connection anyway.
-    reader.read_to_end().await
+    // Legal for an HTTP/1.0-style response, but the stream is dead
+    // afterward either way -- reaching EOF means the peer already
+    // closed it, so it can never be pooled.
+    Ok((reader.read_to_end().await?, false))
 }
 
 async fn read_chunked_body(reader: &mut BufReader<'_>) -> Result<Vec<u8>> {

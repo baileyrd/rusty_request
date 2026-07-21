@@ -31,12 +31,15 @@
 //! - `http://` only. **No HTTPS/TLS** -- hand-rolling TLS crypto is a
 //!   serious security risk to improvise in an MVP; see the README and
 //!   issue tracker for the tracked follow-up.
-//! - A fresh TCP connection per request (`Connection: close`) -- no
-//!   connection pooling/keep-alive yet.
+//! - Connection pooling: every `Client` reuses idle connections per
+//!   origin when the server allows it (HTTP/1.1's keep-alive default),
+//!   bounded by a per-origin idle cap and timeout, with a stale pooled
+//!   connection transparently retried once on a fresh connection.
+//!   `ClientBuilder::no_pool` opts out.
 //!
 //! Everything else (multipart uploads, retries, streaming bodies,
-//! proxies, connection reuse) is deliberately deferred -- see the
-//! README's backlog section and the repository's issue tracker.
+//! proxies) is deliberately deferred -- see the README's backlog
+//! section and the repository's issue tracker.
 //!
 //! # Example
 //!
@@ -58,6 +61,7 @@ mod header;
 mod http1;
 mod json;
 mod method;
+mod pool;
 mod request;
 mod response;
 mod status;
@@ -75,7 +79,7 @@ pub use status::StatusCode;
 pub use url::Url;
 
 /// `GET url` via a fresh, default [`Client`]. For repeated requests
-/// (shared headers, a shared timeout, eventually connection reuse),
+/// (shared headers, a shared timeout, connection reuse, cookies),
 /// build a [`Client`] once and reuse it instead.
 pub async fn get(url: &str) -> Result<Response> {
     Client::new().get(url)?.send().await

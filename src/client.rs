@@ -5,6 +5,7 @@ use crate::header::HeaderMap;
 use crate::http1;
 use crate::json;
 use crate::method::Method;
+use crate::pool::{ConnectionPool, PoolKey};
 use crate::request::Request;
 use crate::response::Response;
 use crate::url::{percent_encode, Url};
@@ -15,6 +16,8 @@ use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_REDIRECTS: usize = 30;
+const DEFAULT_MAX_IDLE_PER_HOST: usize = 8;
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const USER_AGENT: &str = concat!("rusty_request/", env!("CARGO_PKG_VERSION"));
 
 /// How a redirect (3xx `Location`) response should be handled.
@@ -28,18 +31,18 @@ enum RedirectPolicy {
 }
 
 /// A reusable request configuration: default headers, a default
-/// timeout, and (by default) a shared cookie jar, applied to every
-/// request built from it. Cheap to `Clone` -- every clone shares the
-/// same underlying cookie jar (an `Arc<Mutex<_>>`), matching Python
-/// `requests.Session` semantics: it's the same logical session, not an
-/// independent copy. Unlike `Session`, this does **not** yet reuse TCP
-/// connections across requests (see the backlog).
+/// timeout, and (by default) a shared cookie jar and connection pool,
+/// applied to every request built from it. Cheap to `Clone` -- every
+/// clone shares the same underlying cookie jar and pool (both
+/// `Arc`-backed), matching Python `requests.Session` semantics: it's
+/// the same logical session, not an independent copy.
 #[derive(Debug, Clone)]
 pub struct Client {
     default_headers: HeaderMap,
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool: Option<Arc<ConnectionPool>>,
 }
 
 impl Client {
@@ -61,6 +64,7 @@ impl Client {
             timeout: self.timeout,
             redirect_policy: self.redirect_policy,
             cookie_jar: self.cookie_jar.clone(),
+            pool: self.pool.clone(),
         })
     }
 
@@ -100,6 +104,9 @@ pub struct ClientBuilder {
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool_max_idle_per_host: usize,
+    pool_idle_timeout: Duration,
+    pool_enabled: bool,
 }
 
 impl ClientBuilder {
@@ -113,6 +120,9 @@ impl ClientBuilder {
             timeout: Some(DEFAULT_TIMEOUT),
             redirect_policy: RedirectPolicy::Follow(DEFAULT_MAX_REDIRECTS),
             cookie_jar: Some(Arc::new(Mutex::new(CookieJar::new()))),
+            pool_max_idle_per_host: DEFAULT_MAX_IDLE_PER_HOST,
+            pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
+            pool_enabled: true,
         }
     }
 
@@ -182,12 +192,45 @@ impl ClientBuilder {
         self
     }
 
+    /// Caps how many idle connections are kept per origin
+    /// (scheme+host+port) for reuse (default 8). Excess idle
+    /// connections are simply closed rather than pooled. See also
+    /// [`ClientBuilder::no_pool`] to disable connection reuse entirely.
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.pool_max_idle_per_host = max;
+        self
+    }
+
+    /// How long an idle pooled connection may sit before it's no longer
+    /// offered for reuse (default 90 seconds). This is a client-side
+    /// bound only -- the server may close its end sooner, which is
+    /// handled by transparently retrying once on a fresh connection
+    /// (see the crate README).
+    pub fn pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.pool_idle_timeout = timeout;
+        self
+    }
+
+    /// Disables connection pooling entirely -- every request opens a
+    /// fresh TCP connection and sends `Connection: close`, matching
+    /// this crate's original (pre-pooling) behavior.
+    pub fn no_pool(mut self) -> Self {
+        self.pool_enabled = false;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
             timeout: self.timeout,
             redirect_policy: self.redirect_policy,
             cookie_jar: self.cookie_jar,
+            pool: self.pool_enabled.then(|| {
+                Arc::new(ConnectionPool::new(
+                    self.pool_max_idle_per_host,
+                    self.pool_idle_timeout,
+                ))
+            }),
         }
     }
 }
@@ -206,6 +249,7 @@ pub struct RequestBuilder {
     timeout: Option<Duration>,
     redirect_policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool: Option<Arc<ConnectionPool>>,
 }
 
 impl RequestBuilder {
@@ -313,9 +357,18 @@ impl RequestBuilder {
             timeout: request_timeout,
             redirect_policy,
             cookie_jar,
+            pool,
         } = self;
 
-        let fut = send_with_redirects(method, url, headers, body, redirect_policy, cookie_jar);
+        let fut = send_with_redirects(
+            method,
+            url,
+            headers,
+            body,
+            redirect_policy,
+            cookie_jar,
+            pool,
+        );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
                 Ok(inner) => inner,
@@ -336,6 +389,7 @@ async fn send_with_redirects(
     mut body: Body,
     policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool: Option<Arc<ConnectionPool>>,
 ) -> Result<Response> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -363,9 +417,13 @@ async fn send_with_redirects(
                 wire_headers.insert("Cookie", &merged)?;
             }
         }
-        // No connection reuse in this MVP (see the backlog), so every
-        // request is honest about that on the wire too.
-        wire_headers.insert("Connection", "close")?;
+        // With pooling disabled, say so honestly on the wire too. With
+        // it enabled, HTTP/1.1's persistent-by-default behavior applies
+        // -- no explicit header needed, and a caller's own `Connection`
+        // header (if any) is left alone.
+        if pool.is_none() {
+            wire_headers.insert("Connection", "close")?;
+        }
         // Always computed from the real body, never trusted from a
         // caller-supplied header.
         wire_headers.insert("Content-Length", &body.as_bytes().len().to_string())?;
@@ -377,7 +435,7 @@ async fn send_with_redirects(
             body: body.clone(),
             timeout: None,
         };
-        let response = send_over_new_connection(&request).await?;
+        let response = send_one_hop(pool.as_deref(), &request).await?;
 
         // Store cookies from every hop's response, not just the final
         // one -- an intermediate redirect can set cookies too, and they
@@ -463,18 +521,57 @@ fn basic_auth_header(username: &str, password: &str) -> String {
     )
 }
 
-async fn send_over_new_connection(request: &Request) -> Result<Response> {
-    let addrs = resolve(request.url.host.clone(), request.url.port).await?;
-    let stream = connect(&addrs).await?;
-    let raw = http1::send_request(
-        &stream,
+fn pool_key(url: &Url) -> PoolKey {
+    (url.scheme.clone(), url.host.to_ascii_lowercase(), url.port)
+}
+
+async fn attempt(stream: &TcpStream, request: &Request) -> Result<http1::RawResponse> {
+    http1::send_request(
+        stream,
         request.method,
         &request.url.request_target(),
         &request.url.host_header(),
         &request.headers,
         request.body.as_bytes(),
     )
-    .await?;
+    .await
+}
+
+/// Sends one request, reusing a pooled connection for this origin when
+/// one's available. A pooled connection can be stale -- the server may
+/// have closed it after its own idle timeout, a race no client can
+/// fully avoid -- so any failure on a *pooled* attempt is treated as
+/// exactly that and retried once on a fresh connection (the same
+/// one-retry convention curl and `reqwest` use), rather than surfaced
+/// to the caller as a confusing I/O error. A failure on the fresh
+/// attempt is real and does propagate.
+async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Result<Response> {
+    let key = pool_key(&request.url);
+
+    if let Some(pool) = pool {
+        if let Some(stream) = pool.take(&key) {
+            if let Ok(raw) = attempt(&stream, request).await {
+                if raw.keep_alive {
+                    pool.put(key, stream);
+                }
+                return Ok(Response::new(
+                    raw.status,
+                    raw.headers,
+                    request.url.clone(),
+                    raw.body,
+                ));
+            }
+        }
+    }
+
+    let addrs = resolve(request.url.host.clone(), request.url.port).await?;
+    let stream = connect(&addrs).await?;
+    let raw = attempt(&stream, request).await?;
+    if raw.keep_alive {
+        if let Some(pool) = pool {
+            pool.put(key, stream);
+        }
+    }
     Ok(Response::new(
         raw.status,
         raw.headers,
