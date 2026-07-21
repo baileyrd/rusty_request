@@ -516,10 +516,34 @@ async fn handle_connect(mut client: TcpStream) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let addr = req.target.to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no address for target")
-    })?;
-    let mut upstream = TcpStream::connect(addr).await?;
+    // Try every resolved address in turn, same fallback rusty_request's
+    // own `connect()` uses -- `target` is `localhost:port` in every test
+    // that uses this proxy, and which family `to_socket_addrs()` returns
+    // first for "localhost" isn't guaranteed the same way across
+    // platforms/CI runners; only 127.0.0.1 has anything listening.
+    let mut upstream = None;
+    let mut last_err = None;
+    for addr in req.target.to_socket_addrs()? {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                upstream = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut upstream = match upstream {
+        Some(stream) => stream,
+        None => {
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no address for target")
+            }));
+        }
+    };
+
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
