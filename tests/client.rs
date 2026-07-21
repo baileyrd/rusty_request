@@ -1167,3 +1167,150 @@ fn retry_respects_the_retry_after_header() {
         assert!(start.elapsed() >= Duration::from_millis(900));
     });
 }
+
+#[test]
+fn proxy_routes_the_connection_and_sends_an_absolute_form_target() {
+    run(async {
+        // The target host is deliberately unresolvable via real DNS --
+        // the request only succeeds at all if the client routed the
+        // connection to the proxy instead of trying to resolve/connect
+        // to the target directly.
+        let proxy = start_test_server(|req| {
+            assert_eq!(req.target, "http://internal.example.test/data?x=1");
+            assert_eq!(req.header("host"), Some("internal.example.test"));
+            http_response(200, "OK", &[], b"via proxy")
+        });
+
+        let client = Client::builder().proxy(&proxy.url("")).unwrap().build();
+        let resp = client
+            .get("http://internal.example.test/data?x=1")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text().unwrap(), "via proxy");
+    });
+}
+
+#[test]
+fn proxy_bypass_connects_directly_for_matching_hosts() {
+    run(async {
+        let origin = start_test_server(|req| {
+            // Origin-form, not absolute-form -- proves this request went
+            // straight to the origin rather than through the proxy.
+            assert_eq!(req.target, "/direct");
+            http_response(200, "OK", &[], b"direct")
+        });
+        let proxy = start_test_server(|_req| http_response(200, "OK", &[], b"via proxy"));
+
+        let client = Client::builder()
+            .proxy(&proxy.url(""))
+            .unwrap()
+            .proxy_bypass(["127.0.0.1"])
+            .build();
+
+        let resp = client
+            .get(&origin.url("/direct"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.text().unwrap(), "direct");
+        assert_eq!(proxy.connections_accepted(), 0);
+        assert_eq!(origin.connections_accepted(), 1);
+    });
+}
+
+#[test]
+fn proxy_bypass_star_disables_proxying_entirely() {
+    run(async {
+        let origin = start_test_server(|_req| http_response(200, "OK", &[], b"direct"));
+        let proxy = start_test_server(|_req| http_response(200, "OK", &[], b"via proxy"));
+
+        let client = Client::builder()
+            .proxy(&proxy.url(""))
+            .unwrap()
+            .proxy_bypass(["*"])
+            .build();
+
+        client.get(&origin.url("/")).unwrap().send().await.unwrap();
+
+        assert_eq!(proxy.connections_accepted(), 0);
+        assert_eq!(origin.connections_accepted(), 1);
+    });
+}
+
+#[test]
+fn no_proxy_disables_a_previously_configured_proxy() {
+    run(async {
+        let origin = start_test_server(|_req| http_response(200, "OK", &[], b"direct"));
+        let proxy = start_test_server(|_req| http_response(200, "OK", &[], b"via proxy"));
+
+        let client = Client::builder()
+            .proxy(&proxy.url(""))
+            .unwrap()
+            .no_proxy()
+            .build();
+
+        client.get(&origin.url("/")).unwrap().send().await.unwrap();
+
+        assert_eq!(proxy.connections_accepted(), 0);
+        assert_eq!(origin.connections_accepted(), 1);
+    });
+}
+
+#[test]
+fn request_level_proxy_overrides_the_client_default() {
+    run(async {
+        let client_proxy = start_test_server(|_req| http_response(200, "OK", &[], b"client proxy"));
+        let request_proxy =
+            start_test_server(|_req| http_response(200, "OK", &[], b"request proxy"));
+
+        let client = Client::builder()
+            .proxy(&client_proxy.url(""))
+            .unwrap()
+            .build();
+
+        let resp = client
+            .get("http://some.unresolvable.example/")
+            .unwrap()
+            .proxy(&request_proxy.url(""))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.text().unwrap(), "request proxy");
+        assert_eq!(client_proxy.connections_accepted(), 0);
+        assert_eq!(request_proxy.connections_accepted(), 1);
+    });
+}
+
+#[test]
+fn proxy_connection_is_reused_across_different_origins() {
+    run(async {
+        let proxy = start_test_server(|_req| http_response(200, "OK", &[], b"ok"));
+        let client = Client::builder().proxy(&proxy.url("")).unwrap().build();
+
+        client
+            .get("http://first.unresolvable.example/")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        client
+            .get("http://second.unresolvable.example/")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        // One persistent connection to the proxy served both (different)
+        // origins -- correct for plain forward-proxying, unlike a direct
+        // connection pool which is keyed per-origin.
+        assert_eq!(proxy.connections_accepted(), 1);
+    });
+}

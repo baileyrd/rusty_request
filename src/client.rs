@@ -7,6 +7,7 @@ use crate::json;
 use crate::method::Method;
 use crate::multipart::Multipart;
 use crate::pool::{ConnectionPool, PoolKey};
+use crate::proxy::{NoProxyRules, Proxy};
 use crate::request::Request;
 use crate::response::Response;
 use crate::retry::RetryPolicy;
@@ -48,6 +49,8 @@ pub struct Client {
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
     retry_policy: Option<RetryPolicy>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 }
 
 impl Client {
@@ -71,6 +74,8 @@ impl Client {
             cookie_jar: self.cookie_jar.clone(),
             pool: self.pool.clone(),
             retry_policy: self.retry_policy.clone(),
+            proxy: self.proxy.clone(),
+            proxy_bypass: self.proxy_bypass.clone(),
         })
     }
 
@@ -114,6 +119,8 @@ pub struct ClientBuilder {
     pool_idle_timeout: Duration,
     pool_enabled: bool,
     retry_policy: Option<RetryPolicy>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 }
 
 impl ClientBuilder {
@@ -131,6 +138,8 @@ impl ClientBuilder {
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
             pool_enabled: true,
             retry_policy: None,
+            proxy: None,
+            proxy_bypass: NoProxyRules::default(),
         }
     }
 
@@ -243,6 +252,68 @@ impl ClientBuilder {
         self
     }
 
+    /// Routes every plain `http://` request built from the resulting
+    /// [`Client`] through the given HTTP forward proxy instead of
+    /// connecting to the origin directly, unless a
+    /// [`ClientBuilder::proxy_bypass`] rule matches the origin host.
+    /// Disabled by default. See [`Proxy::http`] for the URL format and
+    /// scope (no `https://` proxy, no `CONNECT` tunnel).
+    pub fn proxy(mut self, proxy_url: &str) -> Result<Self> {
+        self.proxy = Some(Proxy::http(proxy_url)?);
+        Ok(self)
+    }
+
+    /// Reads a proxy configuration from the environment, matching
+    /// `requests`' `HTTP_PROXY`/`NO_PROXY` convention: `HTTP_PROXY` (or
+    /// lowercase `http_proxy`) sets the proxy exactly like
+    /// [`ClientBuilder::proxy`], and `NO_PROXY`/`no_proxy` sets the
+    /// bypass rules exactly like [`ClientBuilder::proxy_bypass`]. Either
+    /// left unset simply leaves that part of the configuration alone.
+    ///
+    /// `HTTPS_PROXY` isn't read -- this crate is `http://`-only, so it
+    /// could never apply to anything today. As a mitigation for
+    /// ["httpoxy"](https://httpoxy.org) (CVE-2016-5385 and siblings) --
+    /// a CGI/FastCGI handler that maps an inbound `Proxy:` request
+    /// header onto the `HTTP_PROXY` environment variable, letting a
+    /// remote client redirect this process's own outbound requests --
+    /// the uppercase `HTTP_PROXY` is ignored whenever `REQUEST_METHOD`
+    /// is also set (the standard signal that the process is running in
+    /// a CGI context, the same check curl uses); the lowercase
+    /// `http_proxy` is never attacker-reachable via a header and is
+    /// always trusted.
+    pub fn proxy_from_env(mut self) -> Result<Self> {
+        if let Some(url) = env_http_proxy() {
+            self.proxy = Some(Proxy::http(&url)?);
+        }
+        if let Some(spec) = env_no_proxy() {
+            self.proxy_bypass = NoProxyRules::parse(&spec);
+        }
+        Ok(self)
+    }
+
+    /// Hosts that skip the configured proxy and connect directly (RFC-less
+    /// but universal `NO_PROXY` convention): each entry matches a host
+    /// exactly or as a dot-boundary suffix (`example.com` also matches
+    /// `www.example.com`), except `*`, which bypasses the proxy for
+    /// every host. Only meaningful alongside [`ClientBuilder::proxy`]/
+    /// [`ClientBuilder::proxy_from_env`].
+    pub fn proxy_bypass<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.proxy_bypass = NoProxyRules::from_hosts(hosts);
+        self
+    }
+
+    /// Disables proxying entirely -- the default; only useful to
+    /// override a previously-set proxy earlier in the same builder
+    /// chain.
+    pub fn no_proxy(mut self) -> Self {
+        self.proxy = None;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
@@ -256,8 +327,32 @@ impl ClientBuilder {
                 ))
             }),
             retry_policy: self.retry_policy,
+            proxy: self.proxy,
+            proxy_bypass: self.proxy_bypass,
         }
     }
+}
+
+/// httpoxy mitigation (see [`ClientBuilder::proxy_from_env`]'s docs):
+/// `HTTP_PROXY` is only trusted outside a CGI context; `http_proxy`
+/// always is.
+fn env_http_proxy() -> Option<String> {
+    let in_cgi_context = std::env::var_os("REQUEST_METHOD").is_some();
+    if !in_cgi_context {
+        if let Ok(v) = std::env::var("HTTP_PROXY") {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    std::env::var("http_proxy").ok().filter(|v| !v.is_empty())
+}
+
+fn env_no_proxy() -> Option<String> {
+    std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok())
+        .filter(|v| !v.is_empty())
 }
 
 impl Default for ClientBuilder {
@@ -276,6 +371,8 @@ pub struct RequestBuilder {
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
     retry_policy: Option<RetryPolicy>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 }
 
 impl RequestBuilder {
@@ -397,6 +494,31 @@ impl RequestBuilder {
         self
     }
 
+    /// Routes this request through the given HTTP forward proxy,
+    /// overriding the `Client`'s default. See [`ClientBuilder::proxy`].
+    pub fn proxy(mut self, proxy_url: &str) -> Result<Self> {
+        self.proxy = Some(Proxy::http(proxy_url)?);
+        Ok(self)
+    }
+
+    /// Bypass rules for this request, overriding the `Client`'s
+    /// default. See [`ClientBuilder::proxy_bypass`].
+    pub fn proxy_bypass<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.proxy_bypass = NoProxyRules::from_hosts(hosts);
+        self
+    }
+
+    /// Disables proxying for this request, overriding the `Client`'s
+    /// default.
+    pub fn no_proxy(mut self) -> Self {
+        self.proxy = None;
+        self
+    }
+
     pub async fn send(self) -> Result<Response> {
         let RequestBuilder {
             method,
@@ -408,6 +530,8 @@ impl RequestBuilder {
             cookie_jar,
             pool,
             retry_policy,
+            proxy,
+            proxy_bypass,
         } = self;
 
         let fut = send_with_retries(
@@ -419,6 +543,8 @@ impl RequestBuilder {
             cookie_jar,
             pool,
             retry_policy,
+            proxy,
+            proxy_bypass,
         );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
@@ -461,6 +587,8 @@ impl RequestBuilder {
             cookie_jar,
             pool,
             retry_policy: _,
+            proxy,
+            proxy_bypass,
         } = self;
 
         let fut = send_with_redirects_streaming(
@@ -471,6 +599,8 @@ impl RequestBuilder {
             redirect_policy,
             cookie_jar,
             pool,
+            proxy,
+            proxy_bypass,
         );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
@@ -497,6 +627,8 @@ async fn send_with_retries(
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
     retry_policy: Option<RetryPolicy>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 ) -> Result<Response> {
     let Some(policy) = retry_policy else {
         return send_with_redirects(
@@ -507,6 +639,8 @@ async fn send_with_retries(
             redirect_policy,
             cookie_jar,
             pool,
+            proxy,
+            proxy_bypass,
         )
         .await;
     };
@@ -521,6 +655,8 @@ async fn send_with_retries(
             redirect_policy,
             cookie_jar.clone(),
             pool.clone(),
+            proxy.clone(),
+            proxy_bypass.clone(),
         )
         .await;
 
@@ -544,6 +680,7 @@ async fn send_with_retries(
 /// Sends the request, following redirects per `policy`. The overall
 /// timeout (if any) wraps this whole chain, not each individual hop --
 /// otherwise a slow redirect chain could add hops to dodge it.
+#[allow(clippy::too_many_arguments)]
 async fn send_with_redirects(
     mut method: Method,
     mut url: Url,
@@ -552,6 +689,8 @@ async fn send_with_redirects(
     policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 ) -> Result<Response> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -560,6 +699,7 @@ async fn send_with_redirects(
         if url.scheme != "http" {
             return Err(Error::UnsupportedScheme(url.scheme));
         }
+        let proxy_for_hop = active_proxy(&proxy, &proxy_bypass, &url);
 
         let wire_headers =
             build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
@@ -571,7 +711,7 @@ async fn send_with_redirects(
             body: body.clone(),
             timeout: None,
         };
-        let response = send_one_hop(pool.as_deref(), &request).await?;
+        let response = send_one_hop(pool.as_deref(), &request, proxy_for_hop).await?;
 
         // Store cookies from every hop's response, not just the final
         // one -- an intermediate redirect can set cookies too, and they
@@ -626,6 +766,17 @@ async fn send_with_redirects(
         url = next_url;
         hop += 1;
     }
+}
+
+/// Whether `proxy` applies to a request to `url`, re-evaluated fresh
+/// for every hop (a redirect can land on a host `bypass` matches even
+/// if the original one didn't, or vice versa).
+fn active_proxy<'a>(
+    proxy: &'a Option<Proxy>,
+    bypass: &NoProxyRules,
+    url: &Url,
+) -> Option<&'a Proxy> {
+    proxy.as_ref().filter(|_| !bypass.bypasses(&url.host))
 }
 
 /// Builds the headers actually sent on the wire for one hop: a default
@@ -689,6 +840,7 @@ fn build_wire_headers(
 /// therefore not the one to hand back to the caller) until after its
 /// status/headers have already arrived, so every hop uses the streaming
 /// read path and only redirect hops get drained afterward.
+#[allow(clippy::too_many_arguments)]
 async fn send_with_redirects_streaming(
     mut method: Method,
     mut url: Url,
@@ -697,6 +849,8 @@ async fn send_with_redirects_streaming(
     policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
+    proxy: Option<Proxy>,
+    proxy_bypass: NoProxyRules,
 ) -> Result<StreamingResponse> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -705,6 +859,7 @@ async fn send_with_redirects_streaming(
         if url.scheme != "http" {
             return Err(Error::UnsupportedScheme(url.scheme));
         }
+        let proxy_for_hop = active_proxy(&proxy, &proxy_bypass, &url);
 
         let wire_headers =
             build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
@@ -717,7 +872,7 @@ async fn send_with_redirects_streaming(
             timeout: None,
         };
         let (status, resp_headers, mut streaming_body) =
-            send_one_hop_streaming(pool.as_deref(), &request).await?;
+            send_one_hop_streaming(pool.as_deref(), &request, proxy_for_hop).await?;
 
         if let Some(jar) = &cookie_jar {
             let set_cookie_values: Vec<&str> = resp_headers
@@ -809,11 +964,49 @@ fn pool_key(url: &Url) -> PoolKey {
     (url.scheme.clone(), url.host.to_ascii_lowercase(), url.port)
 }
 
-async fn attempt(stream: TcpStream, request: &Request) -> Result<http1::RawResponse> {
+/// Where a hop's TCP connection actually goes, and what request-target/
+/// pool key that implies -- routed through `proxy` when it applies to
+/// this hop (see [`active_proxy`]), straight to the origin otherwise.
+/// A proxied request uses the absolute-form request-target (RFC 7230
+/// §5.3.2) so the proxy knows which origin to forward it to, and is
+/// pooled under the proxy's own identity rather than the origin's --
+/// correct (not just convenient) for plain forward-proxying, since one
+/// persistent connection to the proxy can carry requests for several
+/// different origins in turn, exactly like a browser configured with an
+/// HTTP proxy reuses its connection to the proxy across sites.
+struct HopTarget {
+    connect_host: String,
+    connect_port: u16,
+    pool_key: PoolKey,
+    request_target: String,
+}
+
+fn hop_target(url: &Url, proxy: Option<&Proxy>) -> HopTarget {
+    match proxy {
+        Some(p) => HopTarget {
+            connect_host: p.host.clone(),
+            connect_port: p.port,
+            pool_key: p.pool_key(),
+            request_target: url.absolute_form(),
+        },
+        None => HopTarget {
+            connect_host: url.host.clone(),
+            connect_port: url.port,
+            pool_key: pool_key(url),
+            request_target: url.request_target(),
+        },
+    }
+}
+
+async fn attempt(
+    stream: TcpStream,
+    request: &Request,
+    request_target: &str,
+) -> Result<http1::RawResponse> {
     http1::send_request(
         stream,
         request.method,
-        &request.url.request_target(),
+        request_target,
         &request.url.host_header(),
         &request.headers,
         &request.body,
@@ -824,11 +1017,12 @@ async fn attempt(stream: TcpStream, request: &Request) -> Result<http1::RawRespo
 async fn attempt_streaming(
     stream: TcpStream,
     request: &Request,
+    request_target: &str,
 ) -> Result<http1::StreamingRawResponse> {
     http1::send_request_streaming(
         stream,
         request.method,
-        &request.url.request_target(),
+        request_target,
         &request.url.host_header(),
         &request.headers,
         &request.body,
@@ -836,22 +1030,27 @@ async fn attempt_streaming(
     .await
 }
 
-/// Sends one request, reusing a pooled connection for this origin when
-/// one's available. A pooled connection can be stale -- the server may
-/// have closed it after its own idle timeout, a race no client can
-/// fully avoid -- so any failure on a *pooled* attempt is treated as
-/// exactly that and retried once on a fresh connection (the same
-/// one-retry convention curl and `reqwest` use), rather than surfaced
-/// to the caller as a confusing I/O error. A failure on the fresh
-/// attempt is real and does propagate.
-async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Result<Response> {
-    let key = pool_key(&request.url);
+/// Sends one request, reusing a pooled connection for this origin (or,
+/// with `proxy` set, this proxy -- see [`hop_target`]) when one's
+/// available. A pooled connection can be stale -- the server may have
+/// closed it after its own idle timeout, a race no client can fully
+/// avoid -- so any failure on a *pooled* attempt is treated as exactly
+/// that and retried once on a fresh connection (the same one-retry
+/// convention curl and `reqwest` use), rather than surfaced to the
+/// caller as a confusing I/O error. A failure on the fresh attempt is
+/// real and does propagate.
+async fn send_one_hop(
+    pool: Option<&ConnectionPool>,
+    request: &Request,
+    proxy: Option<&Proxy>,
+) -> Result<Response> {
+    let target = hop_target(&request.url, proxy);
 
     if let Some(pool) = pool {
-        if let Some(stream) = pool.take(&key) {
-            if let Ok(raw) = attempt(stream, request).await {
+        if let Some(stream) = pool.take(&target.pool_key) {
+            if let Ok(raw) = attempt(stream, request, &target.request_target).await {
                 if raw.keep_alive {
-                    pool.put(key, raw.stream);
+                    pool.put(target.pool_key, raw.stream);
                 }
                 return Ok(Response::new(
                     raw.status,
@@ -863,12 +1062,12 @@ async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Resul
         }
     }
 
-    let addrs = resolve(request.url.host.clone(), request.url.port).await?;
+    let addrs = resolve(target.connect_host, target.connect_port).await?;
     let stream = connect(&addrs).await?;
-    let raw = attempt(stream, request).await?;
+    let raw = attempt(stream, request, &target.request_target).await?;
     if raw.keep_alive {
         if let Some(pool) = pool {
-            pool.put(key, raw.stream);
+            pool.put(target.pool_key, raw.stream);
         }
     }
     Ok(Response::new(
@@ -888,20 +1087,21 @@ async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Resul
 async fn send_one_hop_streaming(
     pool: Option<&ConnectionPool>,
     request: &Request,
+    proxy: Option<&Proxy>,
 ) -> Result<(StatusCode, HeaderMap, http1::StreamingBody)> {
-    let key = pool_key(&request.url);
+    let target = hop_target(&request.url, proxy);
 
     if let Some(pool) = pool {
-        if let Some(stream) = pool.take(&key) {
-            if let Ok(raw) = attempt_streaming(stream, request).await {
+        if let Some(stream) = pool.take(&target.pool_key) {
+            if let Ok(raw) = attempt_streaming(stream, request, &target.request_target).await {
                 return Ok((raw.status, raw.headers, raw.body));
             }
         }
     }
 
-    let addrs = resolve(request.url.host.clone(), request.url.port).await?;
+    let addrs = resolve(target.connect_host, target.connect_port).await?;
     let stream = connect(&addrs).await?;
-    let raw = attempt_streaming(stream, request).await?;
+    let raw = attempt_streaming(stream, request, &target.request_target).await?;
     Ok((raw.status, raw.headers, raw.body))
 }
 

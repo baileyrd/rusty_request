@@ -90,6 +90,19 @@ impl Url {
         }
     }
 
+    /// The absolute-form request-target (RFC 7230 §5.3.2) an HTTP
+    /// forward proxy expects instead of origin-form: the full URL
+    /// rather than just `path?query`, so the proxy knows which origin
+    /// to forward the request to.
+    pub(crate) fn absolute_form(&self) -> String {
+        format!(
+            "{}://{}{}",
+            self.scheme,
+            self.host_header(),
+            self.request_target()
+        )
+    }
+
     /// Returns a copy with `pairs` appended to the query string,
     /// percent-encoding each key/value.
     pub fn with_query_pairs<I, K, V>(&self, pairs: I) -> Url

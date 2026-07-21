@@ -55,9 +55,18 @@
 //!   Two first-pass scope boundaries, both documented on
 //!   `send_streaming`: it ignores any configured `RetryPolicy`, and its
 //!   connection is never pooled afterward.
+//! - Proxy support: `ClientBuilder::proxy(url)` (or
+//!   `.proxy_from_env()` for `HTTP_PROXY`/`http_proxy`, with an httpoxy-
+//!   style mitigation -- see `src/proxy.rs`) routes plain `http://`
+//!   requests through an HTTP forward proxy (absolute-form
+//!   request-target, `Host` still naming the origin). `NO_PROXY`-style
+//!   bypass rules via `.proxy_bypass(hosts)`/`.proxy_from_env()`'s
+//!   `NO_PROXY`/`no_proxy`. `CONNECT`-tunnel proxying (for eventual
+//!   HTTPS) is deferred until TLS lands -- this crate is `http://`-only
+//!   end to end today, so plain forwarding is all there is to build.
 //!
-//! Everything else (proxies) is deliberately deferred -- see the
-//! README's backlog section and the repository's issue tracker.
+//! Everything else is deliberately deferred -- see the README's backlog
+//! section and the repository's issue tracker.
 //!
 //! # Example
 //!
@@ -81,6 +90,7 @@ mod json;
 mod method;
 mod multipart;
 mod pool;
+mod proxy;
 mod rand;
 mod request;
 mod response;
@@ -96,6 +106,7 @@ pub use header::HeaderMap;
 pub use json::Value as Json;
 pub use method::Method;
 pub use multipart::Multipart;
+pub use proxy::Proxy;
 pub use request::Request;
 pub use response::Response;
 pub use retry::{Backoff, RetryPolicy};
