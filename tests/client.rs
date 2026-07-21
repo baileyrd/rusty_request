@@ -1,7 +1,7 @@
 mod common;
 
 use common::{http_chunked_response, http_response, run, start_test_server};
-use rusty_request::{Backoff, Client, Error, Json, RetryPolicy};
+use rusty_request::{Backoff, Client, Error, Json, Multipart, RetryPolicy};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +62,48 @@ fn post_json_body_round_trips() {
             json.get("you_sent").unwrap().get("age").unwrap().as_f64(),
             Some(36.0)
         );
+    });
+}
+
+#[test]
+fn multipart_upload_reaches_the_server_with_a_matching_boundary_and_parts() {
+    run(async {
+        let server = start_test_server(|req| {
+            assert_eq!(req.method, "POST");
+            let content_type = req.header("content-type").unwrap().to_string();
+            assert!(content_type.starts_with("multipart/form-data; boundary="));
+            let boundary = content_type
+                .strip_prefix("multipart/form-data; boundary=")
+                .unwrap();
+
+            let body = String::from_utf8_lossy(&req.body);
+            assert!(body.contains(&format!("--{boundary}\r\n")));
+            assert!(
+                body.contains("Content-Disposition: form-data; name=\"title\"\r\n\r\nMy Upload")
+            );
+            assert!(body.contains(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\
+                 Content-Type: text/plain\r\n\r\nhello file"
+            ));
+            assert!(body.ends_with(&format!("--{boundary}--\r\n")));
+
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let form = Multipart::new()
+            .text("title", "My Upload")
+            .file_with_content_type("file", "a.txt", "text/plain", b"hello file".to_vec());
+
+        let resp = Client::new()
+            .post(&server.url("/upload"))
+            .unwrap()
+            .multipart(form)
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
     });
 }
 

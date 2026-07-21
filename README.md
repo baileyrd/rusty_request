@@ -87,6 +87,13 @@ not silently unsupported or half-implemented.
   can otherwise duplicate a side effect the first attempt already
   caused. The `Client`/request-level `timeout` (if set) wraps every
   attempt and backoff sleep, not just the first one.
+- **Multipart file uploads**: `.multipart(Multipart::new()...)` on
+  `RequestBuilder` builds a `multipart/form-data` body (RFC 7578) --
+  hand-rolled boundary generation and part framing, no dependency.
+  `Multipart::text(name, value)` for plain fields,
+  `Multipart::file(name, filename, bytes)` /
+  `Multipart::file_with_content_type(...)` for file parts. Fully
+  buffered in memory today, like every other request body.
 
 ## Example
 
@@ -137,7 +144,6 @@ Tracked as issues in this repository:
 - **HTTPS/TLS support** -- needs a dedicated, carefully-reviewed effort
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
-- **Multipart file uploads**.
 - **Streaming request and response bodies** -- everything is fully
   buffered in memory today.
 - **Proxy support**.
