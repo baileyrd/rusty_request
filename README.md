@@ -24,11 +24,10 @@ not silently unsupported or half-implemented.
 - **Methods**: GET, POST, PUT, PATCH, DELETE, HEAD.
 - **Client + top-level functions**: `rusty_request::get(url).await?` for
   one-off calls, or build a `Client` to share default headers, a
-  timeout, and cookies across requests (mirrors `requests`' module-level
-  functions + `Session` split). Cloning a `Client` shares the same
-  underlying cookie jar -- it's the same logical session, not an
-  independent copy. Unlike `Session`, this does not yet reuse TCP
-  connections; see the backlog.
+  timeout, cookies, and pooled connections across requests (mirrors
+  `requests`' module-level functions + `Session` split). Cloning a
+  `Client` shares the same underlying cookie jar and connection pool --
+  it's the same logical session, not an independent copy.
 - **Requests**: custom headers, query parameters (percent-encoded),
   string/bytes/JSON/form-urlencoded bodies, per-request or per-client
   timeouts.
@@ -61,8 +60,18 @@ not silently unsupported or half-implemented.
   the host that sent it," not full supercookie prevention.
 - **HTTP/1.1 framing**: `Content-Length` and `Transfer-Encoding: chunked`
   response bodies, plus close-delimited (EOF-terminated) bodies as a
-  fallback. No connection reuse -- every request opens a fresh TCP
-  connection and sends `Connection: close`.
+  fallback.
+- **Connection pooling**: idle connections are kept per origin
+  (scheme+host+port) and reused when the server allows it (HTTP/1.1's
+  keep-alive default, unless it sends `Connection: close` or the
+  response body was close-delimited) -- capped at 8 idle connections
+  per origin and a 90-second idle timeout by default
+  (`ClientBuilder::pool_max_idle_per_host`/`pool_idle_timeout`). A
+  pooled connection the server already closed (a race no client can
+  fully avoid) is retried once on a fresh connection rather than
+  surfaced as an error, the same convention curl and `reqwest` use.
+  `ClientBuilder::no_pool()` reverts to a fresh connection with
+  `Connection: close` on every request.
 - **JSON**: a small hand-rolled `Value` enum with a parser/serializer
   (`rusty_request::Json`) -- no `serde`. No derive-based mapping to
   arbitrary Rust structs; build/read `Value`s directly.
@@ -121,8 +130,6 @@ Tracked as issues in this repository:
 - **Streaming request and response bodies** -- everything is fully
   buffered in memory today.
 - **Proxy support**.
-- **Connection pooling / keep-alive** -- every request currently opens a
-  fresh TCP connection.
 
 ## Testing
 

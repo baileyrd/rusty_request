@@ -655,3 +655,95 @@ fn secure_cookie_is_never_sent_over_plain_http_end_to_end() {
             .unwrap();
     });
 }
+
+#[test]
+fn connection_is_reused_for_a_second_request_to_the_same_origin() {
+    run(async {
+        let server = start_test_server(|_req| http_response(200, "OK", &[], b"ok"));
+
+        let client = Client::new();
+        client.get(&server.url("/a")).unwrap().send().await.unwrap();
+        client.get(&server.url("/b")).unwrap().send().await.unwrap();
+
+        assert_eq!(server.connections_accepted(), 1);
+    });
+}
+
+#[test]
+fn connection_is_not_reused_when_response_says_close() {
+    run(async {
+        let server =
+            start_test_server(|_req| http_response(200, "OK", &[("Connection", "close")], b"ok"));
+
+        let client = Client::new();
+        client.get(&server.url("/a")).unwrap().send().await.unwrap();
+        client.get(&server.url("/b")).unwrap().send().await.unwrap();
+
+        assert_eq!(server.connections_accepted(), 2);
+    });
+}
+
+#[test]
+fn no_pool_never_reuses_a_connection() {
+    run(async {
+        let server = start_test_server(|_req| http_response(200, "OK", &[], b"ok"));
+
+        let client = Client::builder().no_pool().build();
+        client.get(&server.url("/a")).unwrap().send().await.unwrap();
+        client.get(&server.url("/b")).unwrap().send().await.unwrap();
+
+        assert_eq!(server.connections_accepted(), 2);
+    });
+}
+
+#[test]
+fn stale_pooled_connection_is_retried_on_a_fresh_connection() {
+    run(async {
+        let listener = rusty_tokio::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        rusty_tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                rusty_tokio::spawn(async move {
+                    // Serve exactly one request per accepted connection,
+                    // then let `stream` drop -- every connection looks,
+                    // from the client's point of view, like a server
+                    // that hung up right after its own keep-alive idle
+                    // timeout, in between the client's two requests.
+                    if let Ok(_req) = common::read_request(&stream).await {
+                        let _ = stream
+                            .write_all(&common::http_response(200, "OK", &[], b"ok"))
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let client = Client::new();
+        let first = client
+            .get(&format!("http://{addr}/a"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status().as_u16(), 200);
+
+        // Give the per-connection task above time to finish and drop
+        // its stream, so the pooled connection is genuinely dead by the
+        // time the client tries to reuse it below -- otherwise this
+        // test wouldn't reliably exercise the retry path at all.
+        rusty_tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let second = client
+            .get(&format!("http://{addr}/b"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status().as_u16(), 200);
+    });
+}
