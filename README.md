@@ -32,6 +32,12 @@ not silently unsupported or half-implemented.
   timeouts.
 - **Responses**: status code, headers, `.text()`, `.bytes()`, `.json()`,
   and a `requests`-style `.error_for_status()`.
+- **Auth helpers**: `.basic_auth(user, pass)` (RFC 7617, via a small
+  hand-rolled base64 encoder -- no `base64` crate) and
+  `.bearer_auth(token)`, on both `RequestBuilder` (per-request) and
+  `ClientBuilder` (applied to every request, overridable per-request).
+  The URL parser still rejects `user:pass@host` userinfo syntax --
+  these helpers are the supported way to set credentials for now.
 - **HTTP/1.1 framing**: `Content-Length` and `Transfer-Encoding: chunked`
   response bodies, plus close-delimited (EOF-terminated) bodies as a
   fallback. No connection reuse -- every request opens a fresh TCP
@@ -83,7 +89,6 @@ Tracked as issues in this repository:
   made with the same `Client`.
 - **Automatic redirect following** (3xx responses).
 - **Multipart file uploads**.
-- **Auth helpers** (HTTP Basic, Bearer tokens).
 - **Retry/backoff**.
 - **Streaming request and response bodies** -- everything is fully
   buffered in memory today.

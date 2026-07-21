@@ -257,3 +257,103 @@ fn invalid_url_is_rejected() {
         assert!(matches!(result, Err(Error::InvalidUrl(_))));
     });
 }
+
+#[test]
+fn request_level_basic_auth_sets_authorization_header() {
+    run(async {
+        let server = start_test_server(|req| {
+            // "Aladdin:open sesame" -- the RFC 7617 example.
+            assert_eq!(
+                req.header("authorization"),
+                Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+            );
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .basic_auth("Aladdin", "open sesame")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn request_level_bearer_auth_sets_authorization_header() {
+    run(async {
+        let server = start_test_server(|req| {
+            assert_eq!(req.header("authorization"), Some("Bearer secret-token"));
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .bearer_auth("secret-token")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn client_level_basic_auth_applies_to_every_request_but_request_level_overrides() {
+    run(async {
+        let server = start_test_server(|req| {
+            let expected = if req.target == "/override" {
+                "Basic Zm9vOmJhcg=="
+            } else {
+                "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+            };
+            assert_eq!(req.header("authorization"), Some(expected));
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let client = Client::builder()
+            .basic_auth("Aladdin", "open sesame")
+            .unwrap()
+            .build();
+
+        // Uses the client-level default.
+        client.get(&server.url("/")).unwrap().send().await.unwrap();
+
+        // A request-level basic_auth() overrides the client default.
+        client
+            .get(&server.url("/override"))
+            .unwrap()
+            .basic_auth("foo", "bar")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn client_level_bearer_auth_applies_to_every_request() {
+    run(async {
+        let server = start_test_server(|req| {
+            assert_eq!(req.header("authorization"), Some("Bearer client-token"));
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let client = Client::builder()
+            .bearer_auth("client-token")
+            .unwrap()
+            .build();
+
+        client.get(&server.url("/")).unwrap().send().await.unwrap();
+        client
+            .get(&server.url("/again"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
