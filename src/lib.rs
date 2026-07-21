@@ -46,10 +46,18 @@
 //!   hand-rolled `multipart/form-data` encoding (RFC 7578), one or more
 //!   named text/file parts, no dependency. Fully buffered in memory, like
 //!   every other request body today.
+//! - Streaming bodies: `Body::streaming(len, open)` for a request body
+//!   produced incrementally rather than fully buffered upfront (raw
+//!   passthrough with `Content-Length` if `len` is known, chunked
+//!   `Transfer-Encoding` if not); `RequestBuilder::send_streaming()` for
+//!   a [`StreamingResponse`] whose body is pulled incrementally via
+//!   `.chunk()` instead of requiring the whole thing in memory first.
+//!   Two first-pass scope boundaries, both documented on
+//!   `send_streaming`: it ignores any configured `RetryPolicy`, and its
+//!   connection is never pooled afterward.
 //!
-//! Everything else (streaming bodies, proxies) is deliberately deferred
-//! -- see the README's backlog section and the repository's issue
-//! tracker.
+//! Everything else (proxies) is deliberately deferred -- see the
+//! README's backlog section and the repository's issue tracker.
 //!
 //! # Example
 //!
@@ -78,6 +86,7 @@ mod request;
 mod response;
 mod retry;
 mod status;
+mod streaming;
 mod url;
 
 pub use body::Body;
@@ -91,6 +100,7 @@ pub use request::Request;
 pub use response::Response;
 pub use retry::{Backoff, RetryPolicy};
 pub use status::StatusCode;
+pub use streaming::StreamingResponse;
 pub use url::Url;
 
 /// `GET url` via a fresh, default [`Client`]. For repeated requests
