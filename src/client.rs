@@ -12,6 +12,7 @@ use crate::request::Request;
 use crate::response::Response;
 use crate::retry::RetryPolicy;
 use crate::status::StatusCode;
+use crate::stream::Conn;
 use crate::streaming::StreamingResponse;
 use crate::url::{percent_encode, Url};
 use rusty_tokio::io::TcpStream;
@@ -696,7 +697,7 @@ async fn send_with_redirects(
     let mut hop = 0usize;
 
     loop {
-        if url.scheme != "http" {
+        if url.scheme != "http" && url.scheme != "https" {
             return Err(Error::UnsupportedScheme(url.scheme));
         }
         let proxy_for_hop = active_proxy(&proxy, &proxy_bypass, &url);
@@ -856,7 +857,7 @@ async fn send_with_redirects_streaming(
     let mut hop = 0usize;
 
     loop {
-        if url.scheme != "http" {
+        if url.scheme != "http" && url.scheme != "https" {
             return Err(Error::UnsupportedScheme(url.scheme));
         }
         let proxy_for_hop = active_proxy(&proxy, &proxy_bypass, &url);
@@ -964,42 +965,145 @@ fn pool_key(url: &Url) -> PoolKey {
     (url.scheme.clone(), url.host.to_ascii_lowercase(), url.port)
 }
 
-/// Where a hop's TCP connection actually goes, and what request-target/
-/// pool key that implies -- routed through `proxy` when it applies to
-/// this hop (see [`active_proxy`]), straight to the origin otherwise.
-/// A proxied request uses the absolute-form request-target (RFC 7230
-/// §5.3.2) so the proxy knows which origin to forward it to, and is
-/// pooled under the proxy's own identity rather than the origin's --
-/// correct (not just convenient) for plain forward-proxying, since one
-/// persistent connection to the proxy can carry requests for several
-/// different origins in turn, exactly like a browser configured with an
-/// HTTP proxy reuses its connection to the proxy across sites.
+/// Where a hop's TCP connection actually goes, what request-target/pool
+/// key that implies, and what (if any) `CONNECT`-tunnel/TLS setup the raw
+/// socket needs before the request itself can be sent -- routed through
+/// `proxy` when it applies to this hop (see [`active_proxy`]), straight
+/// to the origin otherwise.
+///
+/// Three shapes, not two: a plain `http://` proxy hop forwards the
+/// request in absolute-form (RFC 7230 §5.3.2) over a connection pooled
+/// under the *proxy's* identity, since one persistent connection to the
+/// proxy can carry requests for several different origins in turn (same
+/// as a browser configured with an HTTP proxy). An `https://` hop
+/// through a proxy is different in kind, not just in scheme: the proxy
+/// can't read (let alone rewrite) encrypted traffic, so the client first
+/// asks it to open an opaque `CONNECT` tunnel to the origin, then runs
+/// the *entire* TLS handshake and request through that tunnel exactly as
+/// if connected directly -- origin-form request-target, `Host` naming
+/// the origin, no absolute-form. That makes a tunneled connection a
+/// private, origin-specific channel that happens to be routed via the
+/// proxy, not a shareable one, so it gets its own pool-key namespace
+/// (see `Proxy::tunnel_pool_key`) rather than the proxy's shared key.
 struct HopTarget {
     connect_host: String,
     connect_port: u16,
+    /// Set only for an `https://` hop routed through a proxy: the
+    /// origin's (host, port) to `CONNECT` the raw socket to before any
+    /// TLS handshake begins.
+    connect_tunnel: Option<(String, u16)>,
+    /// Set whenever this hop needs a TLS handshake before the request is
+    /// sent (the SNI/hostname-verification name to use) -- every
+    /// `https://` hop, direct or tunneled; never set for `http://`.
+    tls_server_name: Option<String>,
     pool_key: PoolKey,
     request_target: String,
 }
 
 fn hop_target(url: &Url, proxy: Option<&Proxy>) -> HopTarget {
+    let is_https = url.scheme == "https";
     match proxy {
+        Some(p) if is_https => HopTarget {
+            connect_host: p.host.clone(),
+            connect_port: p.port,
+            connect_tunnel: Some((url.host.clone(), url.port)),
+            tls_server_name: Some(url.host.clone()),
+            pool_key: p.tunnel_pool_key(url),
+            request_target: url.request_target(),
+        },
         Some(p) => HopTarget {
             connect_host: p.host.clone(),
             connect_port: p.port,
+            connect_tunnel: None,
+            tls_server_name: None,
             pool_key: p.pool_key(),
             request_target: url.absolute_form(),
         },
         None => HopTarget {
             connect_host: url.host.clone(),
             connect_port: url.port,
+            connect_tunnel: None,
+            tls_server_name: is_https.then(|| url.host.clone()),
             pool_key: pool_key(url),
             request_target: url.request_target(),
         },
     }
 }
 
+/// Turns a freshly dialed, plain TCP connection into the [`Conn`]
+/// `target` actually calls for: a `CONNECT`-tunnel handshake first, if
+/// `target.connect_tunnel` says this hop needs one (`https://` routed
+/// through a proxy), then a TLS handshake, if `target.tls_server_name`
+/// says so (any `https://` hop, tunneled or direct) -- verified against
+/// the system trust store (`rusty_tls::TrustPolicy::System`); this MVP
+/// doesn't expose a way to configure a different policy.
+async fn establish(raw: TcpStream, target: &HopTarget) -> Result<Conn> {
+    if let Some((host, port)) = &target.connect_tunnel {
+        let status = connect_tunnel(&raw, host, *port).await?;
+        if !status.is_success() {
+            return Err(Error::ProxyConnectFailed(status));
+        }
+    }
+    match &target.tls_server_name {
+        Some(name) => {
+            let tls = rusty_tls::AsyncTlsStream::new(raw, name, &rusty_tls::TrustPolicy::System)?;
+            Ok(Conn::Tls(Box::new(tls)))
+        }
+        None => Ok(Conn::Plain(raw)),
+    }
+}
+
+/// A `CONNECT` response head longer than this is treated as a protocol
+/// error rather than read indefinitely.
+const MAX_CONNECT_RESPONSE_LEN: usize = 64 * 1024;
+
+/// Sends `CONNECT host:port HTTP/1.1` on `stream` (a fresh, plain TCP
+/// connection to a proxy) and reads the status line of its response,
+/// stopping at the blank line that ends the head. A successful (2xx)
+/// `CONNECT` response never carries a body, so nothing further is read;
+/// a failing one might, but this crate has no use for it beyond the
+/// status code, so it's left undrained.
+async fn connect_tunnel(stream: &TcpStream, host: &str, port: u16) -> Result<StatusCode> {
+    let authority = format!("{host}:{port}");
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::InvalidResponse(
+                "proxy closed the connection before responding to CONNECT".into(),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_CONNECT_RESPONSE_LEN {
+            return Err(Error::InvalidResponse(
+                "proxy's CONNECT response exceeded the maximum allowed length".into(),
+            ));
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let status_line = head.lines().next().unwrap_or("");
+    let code: u16 = status_line
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| {
+            Error::InvalidResponse(format!(
+                "malformed CONNECT response status line `{status_line}`"
+            ))
+        })?;
+    Ok(StatusCode::from_u16(code))
+}
+
 async fn attempt(
-    stream: TcpStream,
+    stream: Conn,
     request: &Request,
     request_target: &str,
 ) -> Result<http1::RawResponse> {
@@ -1015,7 +1119,7 @@ async fn attempt(
 }
 
 async fn attempt_streaming(
-    stream: TcpStream,
+    stream: Conn,
     request: &Request,
     request_target: &str,
 ) -> Result<http1::StreamingRawResponse> {
@@ -1062,8 +1166,9 @@ async fn send_one_hop(
         }
     }
 
-    let addrs = resolve(target.connect_host, target.connect_port).await?;
-    let stream = connect(&addrs).await?;
+    let addrs = resolve(target.connect_host.clone(), target.connect_port).await?;
+    let raw = connect(&addrs).await?;
+    let stream = establish(raw, &target).await?;
     let raw = attempt(stream, request, &target.request_target).await?;
     if raw.keep_alive {
         if let Some(pool) = pool {
@@ -1099,8 +1204,9 @@ async fn send_one_hop_streaming(
         }
     }
 
-    let addrs = resolve(target.connect_host, target.connect_port).await?;
-    let stream = connect(&addrs).await?;
+    let addrs = resolve(target.connect_host.clone(), target.connect_port).await?;
+    let raw = connect(&addrs).await?;
+    let stream = establish(raw, &target).await?;
     let raw = attempt_streaming(stream, request, &target.request_target).await?;
     Ok((raw.status, raw.headers, raw.body))
 }

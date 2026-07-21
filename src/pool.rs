@@ -1,13 +1,13 @@
 //! A simple per-[`crate::Client`] idle-connection pool: hands back a
-//! `rusty_tokio` [`TcpStream`] for reuse on a subsequent request to the
-//! same (scheme, host, port) origin, when the previous response left it
-//! in a reusable state (see `http1::RawResponse::keep_alive`).
+//! [`Conn`] (plain or TLS-wrapped) for reuse on a subsequent request to
+//! the same (scheme, host, port) origin, when the previous response left
+//! it in a reusable state (see `http1::RawResponse::keep_alive`).
 //!
 //! No pipelining -- a pooled connection is only ever handed to one
 //! in-flight request at a time, exactly matching `http1::read_body`'s
 //! own "never more than one response in flight" assumption.
 
-use rusty_tokio::io::TcpStream;
+use crate::stream::Conn;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub(crate) type PoolKey = (String, String, u16);
 
 struct Idle {
-    stream: TcpStream,
+    stream: Conn,
     since: Instant,
 }
 
@@ -39,7 +39,7 @@ impl ConnectionPool {
     /// not FIFO: the most recently returned connection is the one least
     /// likely to have been closed by the peer's own idle timeout in the
     /// meantime.
-    pub(crate) fn take(&self, key: &PoolKey) -> Option<TcpStream> {
+    pub(crate) fn take(&self, key: &PoolKey) -> Option<Conn> {
         let mut idle = self.idle.lock().unwrap();
         let entries = idle.get_mut(key)?;
         let now = Instant::now();
@@ -58,7 +58,7 @@ impl ConnectionPool {
     /// disabled (`max_idle_per_origin == 0`) -- either way, `stream` is
     /// simply dropped (closing it), bounding how many idle connections
     /// a `Client` can accumulate.
-    pub(crate) fn put(&self, key: PoolKey, stream: TcpStream) {
+    pub(crate) fn put(&self, key: PoolKey, stream: Conn) {
         if self.max_idle_per_origin == 0 {
             return;
         }
@@ -73,8 +73,8 @@ impl ConnectionPool {
     }
 }
 
-/// Manual impl -- `rusty_tokio::io::TcpStream` doesn't implement
-/// `Debug`, so `#[derive(Debug)]` isn't an option here.
+/// Manual impl -- `Conn` doesn't implement `Debug` (neither of its
+/// variants do), so `#[derive(Debug)]` isn't an option here.
 impl std::fmt::Debug for ConnectionPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionPool")

@@ -1,9 +1,10 @@
 //! `rusty_request` -- an async, hand-rolled HTTP client in the spirit of
-//! Python's `requests`, with a single dependency: [`rusty_tokio`], our
-//! own from-scratch async runtime. Everything above the raw socket --
-//! URL parsing, HTTP/1.1 request/response framing, and JSON -- is
-//! original code in this crate; no `hyper`, no `reqwest`, no `serde`,
-//! no `url` crate.
+//! Python's `requests`, built on [`rusty_tokio`] (our own from-scratch
+//! async runtime) and [`rusty_tls`](https://github.com/baileyrd/rusty_tls)
+//! (the ecosystem's one shared TLS implementation and trust policy).
+//! Everything above the raw socket -- URL parsing, HTTP/1.1
+//! request/response framing, and JSON -- is original code in this
+//! crate; no `hyper`, no `reqwest`, no `serde`, no `url` crate.
 //!
 //! # MVP scope
 //!
@@ -28,9 +29,11 @@
 //!   `Client`, including across redirect hops -- the same behavior
 //!   `requests.Session` gives by default. `ClientBuilder::no_cookie_store`
 //!   opts out.
-//! - `http://` only. **No HTTPS/TLS** -- hand-rolling TLS crypto is a
-//!   serious security risk to improvise in an MVP; see the README and
-//!   issue tracker for the tracked follow-up.
+//! - `http://` and `https://`. TLS is [`rusty_tls`](https://github.com/baileyrd/rusty_tls)'s,
+//!   not hand-rolled: verified by default against the system trust store,
+//!   SNI from the URL host, TLS 1.2/1.3. No ALPN (this crate is
+//!   HTTP/1.1-only), no client certificates, no custom trust policy --
+//!   see the README and issue tracker for tracked follow-ups.
 //! - Connection pooling: every `Client` reuses idle connections per
 //!   origin when the server allows it (HTTP/1.1's keep-alive default),
 //!   bounded by a per-origin idle cap and timeout, with a stale pooled
@@ -57,13 +60,12 @@
 //!   connection is never pooled afterward.
 //! - Proxy support: `ClientBuilder::proxy(url)` (or
 //!   `.proxy_from_env()` for `HTTP_PROXY`/`http_proxy`, with an httpoxy-
-//!   style mitigation -- see `src/proxy.rs`) routes plain `http://`
-//!   requests through an HTTP forward proxy (absolute-form
-//!   request-target, `Host` still naming the origin). `NO_PROXY`-style
-//!   bypass rules via `.proxy_bypass(hosts)`/`.proxy_from_env()`'s
-//!   `NO_PROXY`/`no_proxy`. `CONNECT`-tunnel proxying (for eventual
-//!   HTTPS) is deferred until TLS lands -- this crate is `http://`-only
-//!   end to end today, so plain forwarding is all there is to build.
+//!   style mitigation -- see `src/proxy.rs`) routes requests through an
+//!   HTTP forward proxy: `http://` requests are forwarded in
+//!   absolute-form (`Host` still naming the origin); `https://` requests
+//!   tunnel through the proxy via `CONNECT`, so the proxy never sees
+//!   the encrypted traffic. `NO_PROXY`-style bypass rules via
+//!   `.proxy_bypass(hosts)`/`.proxy_from_env()`'s `NO_PROXY`/`no_proxy`.
 //!
 //! Everything else is deliberately deferred -- see the README's backlog
 //! section and the repository's issue tracker.
@@ -96,6 +98,7 @@ mod request;
 mod response;
 mod retry;
 mod status;
+mod stream;
 mod streaming;
 mod url;
 

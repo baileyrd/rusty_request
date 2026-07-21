@@ -5,6 +5,14 @@
 //! connection serves requests in a loop (rather than exactly one) so
 //! connection-reuse behavior can be exercised and observed via
 //! [`TestServer::connections_accepted`].
+//!
+//! Shared across every integration test *binary* (each of `tests/*.rs`
+//! declares its own `mod common;` and gets its own copy compiled in) --
+//! so an item only `tests/https.rs` needs looks unused from
+//! `tests/client.rs`'s copy, and vice versa. `#![allow(dead_code)]`
+//! blanket-covers that, rather than sprinkling a `#[allow]` on every
+//! individual item split across the two files.
+#![allow(dead_code)]
 
 use rusty_tokio::io::{TcpListener, TcpStream};
 use std::net::SocketAddr;
@@ -342,4 +350,204 @@ impl rusty_tokio::io::AsyncRead for MemoryReader {
         this.pos += n;
         std::task::Poll::Ready(Ok(()))
     }
+}
+
+/// A TLS counterpart to [`start_test_server`], for exercising the
+/// `https://` connector: a self-signed CA (returned as PEM so a test can
+/// point `SSL_CERT_FILE` at it -- this crate's public API has no way to
+/// pass a custom trust policy through, so that's the only hermetic way
+/// to make `rusty_tls::TrustPolicy::System` trust a test certificate)
+/// signs a leaf certificate valid for `localhost`, and each accepted
+/// connection is served -- request in, response out, request in, ... --
+/// on its own background OS thread, using a synchronous
+/// `rustls::StreamOwned` exactly like `rusty_tls`'s own hermetic tests
+/// do. Deliberately not built on `rusty_tokio`: the server side of a
+/// hermetic TLS test doesn't need to be async, only the client under
+/// test does.
+pub struct TestTlsServer {
+    pub addr: SocketAddr,
+    /// PEM-encoded CA certificate that signed this server's leaf cert.
+    pub ca_cert_pem: String,
+}
+
+pub fn start_tls_test_server<F>(handler: F) -> TestTlsServer
+where
+    F: Fn(&TestRequest) -> Vec<u8> + Send + Sync + 'static,
+{
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+    use std::io::Write;
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "rusty_request test CA");
+    ca_params.distinguished_name = dn;
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+
+    let config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf_cert.der().clone()], key_der)
+            .expect("valid test cert/key"),
+    );
+
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind TLS test server");
+    let addr = listener.local_addr().expect("failed to read local_addr");
+    let handler = Arc::new(handler);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { break };
+            let config = config.clone();
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, tcp);
+                while let Ok(req) = read_request_sync(&mut tls) {
+                    let response = handler(&req);
+                    let must_close = response_requires_close(&response);
+                    if tls.write_all(&response).is_err() || must_close {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    TestTlsServer {
+        addr,
+        ca_cert_pem: ca_cert.pem(),
+    }
+}
+
+/// A minimal synchronous request-line-and-headers reader over anything
+/// `std::io::Read` -- what [`start_tls_test_server`] needs, since its
+/// connections are driven by a blocking `rustls::StreamOwned`, not
+/// `rusty_tokio`. Bodies aren't parsed (every test using this server only
+/// issues bodyless GETs); that's the one thing it doesn't share with
+/// [`read_request`]'s fuller (async, body-aware) implementation.
+fn read_request_sync<S: std::io::Read>(stream: &mut S) -> std::io::Result<TestRequest> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before headers completed",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.splitn(3, ' ');
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    Ok(TestRequest {
+        method,
+        target,
+        headers,
+        body: Vec::new(),
+    })
+}
+
+/// A minimal `CONNECT`-tunneling forward proxy: reads one request line
+/// (expected to be `CONNECT host:port HTTP/1.1`), dials `host:port`
+/// itself, replies `200 Connection Established`, and then relays raw
+/// bytes bidirectionally between the client and that upstream connection
+/// until either side closes -- opaque to whatever protocol (TLS or
+/// otherwise) runs inside the tunnel, exactly like a real forward proxy.
+pub fn start_connect_proxy() -> TestServer {
+    let listener =
+        TcpListener::bind("127.0.0.1:0".parse().unwrap()).expect("failed to bind proxy server");
+    let addr = listener.local_addr().expect("failed to read local_addr");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let connections_for_task = connections.clone();
+
+    rusty_tokio::spawn(async move {
+        loop {
+            let (client, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            connections_for_task.fetch_add(1, Ordering::SeqCst);
+            rusty_tokio::spawn(async move {
+                let _ = handle_connect(client).await;
+            });
+        }
+    });
+
+    TestServer { addr, connections }
+}
+
+async fn handle_connect(mut client: TcpStream) -> std::io::Result<()> {
+    use std::net::ToSocketAddrs;
+
+    let req = read_request(&client).await?;
+    if req.method != "CONNECT" {
+        let _ = client
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return Ok(());
+    }
+
+    // Try every resolved address in turn, same fallback rusty_request's
+    // own `connect()` uses -- `target` is `localhost:port` in every test
+    // that uses this proxy, and which family `to_socket_addrs()` returns
+    // first for "localhost" isn't guaranteed the same way across
+    // platforms/CI runners; only 127.0.0.1 has anything listening.
+    let mut upstream = None;
+    let mut last_err = None;
+    for addr in req.target.to_socket_addrs()? {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                upstream = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut upstream = match upstream {
+        Some(stream) => stream,
+        None => {
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no address for target")
+            }));
+        }
+    };
+
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+
+    rusty_tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
 }

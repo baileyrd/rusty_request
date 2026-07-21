@@ -6,10 +6,34 @@ description = "A hand-rolled, async, zero-crates-io-dependency HTTP client -- a 
 license = "MIT"
 
 [dependencies]
-# The only dependency: our own hand-rolled async runtime (scheduler,
-# reactor, timers) -- no tokio, no mio, no crates.io HTTP/URL/JSON
-# crates. Everything above the raw socket (URL parsing, HTTP/1.1
-# framing, JSON) is original code in this crate. Pinned to a specific
-# rev for reproducibility, same convention rusty_tokio itself uses for
-# its own `platform`/`platform-linux` git dependencies.
-rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "fbeda3b960dc11ae2f0ad44d8e945ab00da072c1" }
+# Our own hand-rolled async runtime (scheduler, reactor, timers) -- no
+# tokio, no mio, no crates.io HTTP/URL/JSON crates. Everything above the
+# raw socket (URL parsing, HTTP/1.1 framing, JSON) is original code in
+# this crate. Pinned to the same rev as `rusty_tls` below (bumped from
+# fbeda3b9) -- required, not just tidy: `rusty_tls::AsyncTlsStream` is
+# generic over this crate's own `AsyncRead`/`AsyncWrite` traits, and Cargo
+# treats two different revs of the same git dependency as two unrelated
+# crates, so their trait/type identities wouldn't match at a different
+# rev even though the source is otherwise compatible.
+rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "ac598c930e85460ae3f79328a1d82f28390672f8" }
+# The ecosystem's one shared TLS implementation and trust policy (see its
+# own README/ARCHITECTURE.md) -- this crate is the design's first named
+# consumer. `rusty-tokio` feature enables its async adapter, which is
+# what this crate's connector needs. Pinned to a specific rev, same
+# convention as `rusty_tokio` above -- and see that dependency's comment
+# for why both pins have to move together.
+rusty_tls = { git = "https://github.com/baileyrd/rusty_tls", rev = "415d8e0d1b58461990377b9e2cdc8799492f8efc", features = [
+    "rusty-tokio",
+] }
+
+[dev-dependencies]
+# Test-only: builds a local TLS server (via a self-signed cert) to
+# exercise the https:// connector and CONNECT-tunnel proxying against,
+# without real network access. Never a dependency of the shipped
+# library -- rusty_tls (a client) is what the library itself uses.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "ring",
+] }
+rcgen = "0.13"
