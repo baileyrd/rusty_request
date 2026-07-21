@@ -1,0 +1,15 @@
+[package]
+name = "rusty_request"
+version = "0.1.0"
+edition = "2021"
+description = "A hand-rolled, async, zero-crates-io-dependency HTTP client -- a Rust take on Python's requests, built on rusty_tokio."
+license = "MIT"
+
+[dependencies]
+# The only dependency: our own hand-rolled async runtime (scheduler,
+# reactor, timers) -- no tokio, no mio, no crates.io HTTP/URL/JSON
+# crates. Everything above the raw socket (URL parsing, HTTP/1.1
+# framing, JSON) is original code in this crate. Pinned to a specific
+# rev for reproducibility, same convention rusty_tokio itself uses for
+# its own `platform`/`platform-linux` git dependencies.
+rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "fbeda3b960dc11ae2f0ad44d8e945ab00da072c1" }
