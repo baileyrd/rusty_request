@@ -520,3 +520,138 @@ fn cross_origin_redirect_strips_authorization_header() {
         assert_eq!(resp.status().as_u16(), 200);
     });
 }
+
+#[test]
+fn cookie_set_on_one_request_is_sent_on_the_next_through_the_same_client() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/login" => http_response(200, "OK", &[("Set-Cookie", "session=abc123")], b""),
+            "/profile" => {
+                assert_eq!(req.header("cookie"), Some("session=abc123"));
+                http_response(200, "OK", &[], b"")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let client = Client::new();
+        client
+            .get(&server.url("/login"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        client
+            .get(&server.url("/profile"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn cookies_are_not_shared_across_different_clients() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/login" => http_response(200, "OK", &[("Set-Cookie", "session=abc123")], b""),
+            "/profile" => {
+                assert_eq!(req.header("cookie"), None);
+                http_response(200, "OK", &[], b"")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        Client::new()
+            .get(&server.url("/login"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        // A different `Client` -- a different session -- must not see
+        // the first client's cookie.
+        Client::new()
+            .get(&server.url("/profile"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn cookie_set_on_a_redirect_hop_is_sent_on_the_next_hop() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/start" => http_response(
+                302,
+                "Found",
+                &[("Set-Cookie", "session=abc123"), ("Location", "/end")],
+                b"",
+            ),
+            "/end" => {
+                assert_eq!(req.header("cookie"), Some("session=abc123"));
+                http_response(200, "OK", &[], b"ok")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let resp = rusty_request::get(&server.url("/start")).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn no_cookie_store_disables_cookie_persistence() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/login" => http_response(200, "OK", &[("Set-Cookie", "session=abc123")], b""),
+            "/profile" => {
+                assert_eq!(req.header("cookie"), None);
+                http_response(200, "OK", &[], b"")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let client = Client::builder().no_cookie_store().build();
+        client
+            .get(&server.url("/login"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        client
+            .get(&server.url("/profile"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn secure_cookie_is_never_sent_over_plain_http_end_to_end() {
+    run(async {
+        let server = start_test_server(|req| match req.target.as_str() {
+            "/login" => http_response(200, "OK", &[("Set-Cookie", "session=abc123; Secure")], b""),
+            "/profile" => {
+                assert_eq!(req.header("cookie"), None);
+                http_response(200, "OK", &[], b"")
+            }
+            other => panic!("unexpected request to {other}"),
+        });
+
+        let client = Client::new();
+        client
+            .get(&server.url("/login"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        client
+            .get(&server.url("/profile"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+    });
+}
