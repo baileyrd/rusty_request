@@ -73,26 +73,14 @@ impl Backoff {
     }
 }
 
-/// A uniform random duration in `[0, max)`. This is deliberately
-/// non-cryptographic -- backoff jitter only needs to avoid a thundering
-/// herd, not resist an adversary, so it doesn't pull in a `rand` crate or
-/// hand-roll a CSPRNG (a real one belongs nowhere near this MVP, same
-/// reasoning as the TLS gap in the README).
+/// A uniform random duration in `[0, max)`. Backoff jitter only needs to
+/// avoid a thundering herd, not resist an adversary -- see
+/// `crate::rand` for why this isn't a CSPRNG.
 fn jittered(max: Duration) -> Duration {
     if max.is_zero() {
         return max;
     }
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = RandomState::new().build_hasher();
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    hasher.write_u128(nanos);
-    let r = hasher.finish();
-
+    let r = crate::rand::next_u64();
     let max_nanos = max.as_nanos().min(u64::MAX as u128) as u64;
     let scaled = ((r as u128 * max_nanos as u128) >> 64) as u64;
     Duration::from_nanos(scaled)

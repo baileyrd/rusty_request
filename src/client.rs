@@ -5,6 +5,7 @@ use crate::header::HeaderMap;
 use crate::http1;
 use crate::json;
 use crate::method::Method;
+use crate::multipart::Multipart;
 use crate::pool::{ConnectionPool, PoolKey};
 use crate::request::Request;
 use crate::response::Response;
@@ -347,6 +348,15 @@ impl RequestBuilder {
         self.headers
             .insert("Content-Type", "application/x-www-form-urlencoded")?;
         self.body = Body::from(encoded);
+        Ok(self)
+    }
+
+    /// Encodes `form` as a `multipart/form-data` body (RFC 7578) and
+    /// sets `Content-Type` to the matching `boundary=...` value.
+    pub fn multipart(mut self, form: Multipart) -> Result<Self> {
+        let (body, content_type) = form.encode();
+        self.headers.insert("Content-Type", &content_type)?;
+        self.body = Body::from(body);
         Ok(self)
     }
 

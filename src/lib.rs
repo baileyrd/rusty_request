@@ -42,10 +42,14 @@
 //!   (with jitter) backoff, `Retry-After` respected and capped, and only
 //!   idempotent methods retried unless explicitly opted into for
 //!   POST/PATCH too. Disabled by default.
+//! - Multipart file uploads: `RequestBuilder::multipart(Multipart)` --
+//!   hand-rolled `multipart/form-data` encoding (RFC 7578), one or more
+//!   named text/file parts, no dependency. Fully buffered in memory, like
+//!   every other request body today.
 //!
-//! Everything else (multipart uploads, streaming bodies, proxies) is
-//! deliberately deferred -- see the README's backlog section and the
-//! repository's issue tracker.
+//! Everything else (streaming bodies, proxies) is deliberately deferred
+//! -- see the README's backlog section and the repository's issue
+//! tracker.
 //!
 //! # Example
 //!
@@ -67,7 +71,9 @@ mod header;
 mod http1;
 mod json;
 mod method;
+mod multipart;
 mod pool;
+mod rand;
 mod request;
 mod response;
 mod retry;
@@ -80,6 +86,7 @@ pub use error::{Error, Result};
 pub use header::HeaderMap;
 pub use json::Value as Json;
 pub use method::Method;
+pub use multipart::Multipart;
 pub use request::Request;
 pub use response::Response;
 pub use retry::{Backoff, RetryPolicy};
