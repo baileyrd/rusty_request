@@ -108,6 +108,23 @@ not silently unsupported or half-implemented.
   Two first-pass scope boundaries (documented on `send_streaming`): any
   configured `RetryPolicy` is ignored, and the connection used isn't
   returned to the pool afterward.
+- **Proxy support**: `.proxy("http://host:port")` on `ClientBuilder`/
+  `RequestBuilder` routes plain `http://` requests through an HTTP
+  forward proxy (absolute-form request-target, `Host` still naming the
+  origin) instead of connecting to the origin directly.
+  `.proxy_from_env()` reads `HTTP_PROXY`/`http_proxy` and `NO_PROXY`/
+  `no_proxy`, matching `requests`' convention -- with an
+  ["httpoxy"](https://httpoxy.org) mitigation: `HTTP_PROXY` is ignored
+  whenever `REQUEST_METHOD` is also set (the standard CGI-context
+  signal), since a CGI/FastCGI handler can map an inbound `Proxy:`
+  header onto that variable. `.proxy_bypass(hosts)` sets `NO_PROXY`-style
+  bypass rules (exact host or subdomain match, or `*` for "never proxy
+  anything"). A proxy connection is pooled under the proxy's own
+  identity rather than the origin's, so one persistent connection can
+  carry requests for several different origins. `CONNECT`-tunnel
+  proxying (for eventual HTTPS) is deferred until TLS lands -- this
+  crate is `http://`-only end to end today, so plain forwarding is all
+  there is to build.
 
 ## Example
 
@@ -158,7 +175,6 @@ Tracked as issues in this repository:
 - **HTTPS/TLS support** -- needs a dedicated, carefully-reviewed effort
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
-- **Proxy support**.
 
 ## Testing
 
