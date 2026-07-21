@@ -1,7 +1,9 @@
 mod common;
 
 use common::{http_chunked_response, http_response, run, start_test_server};
-use rusty_request::{Client, Error, Json};
+use rusty_request::{Backoff, Client, Error, Json, RetryPolicy};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
@@ -745,5 +747,200 @@ fn stale_pooled_connection_is_retried_on_a_fresh_connection() {
             .await
             .unwrap();
         assert_eq!(second.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn retry_recovers_from_a_retryable_status_code() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            if calls_for_handler.fetch_add(1, Ordering::SeqCst) == 0 {
+                http_response(503, "Service Unavailable", &[], b"")
+            } else {
+                http_response(200, "OK", &[], b"ok")
+            }
+        });
+
+        let policy = RetryPolicy::new(2).backoff(Backoff::fixed(Duration::from_millis(1)));
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn retry_exhausts_and_returns_the_last_retryable_response() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            http_response(503, "Service Unavailable", &[], b"")
+        });
+
+        let policy = RetryPolicy::new(2).backoff(Backoff::fixed(Duration::from_millis(1)));
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 503);
+        // The first attempt plus 2 configured retries: 3 total.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    });
+}
+
+#[test]
+fn non_idempotent_requests_are_not_retried_by_default() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            http_response(503, "Service Unavailable", &[], b"")
+        });
+
+        let policy = RetryPolicy::new(3).backoff(Backoff::fixed(Duration::from_millis(1)));
+        let resp = Client::new()
+            .post(&server.url("/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 503);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn retry_non_idempotent_opts_a_post_into_retrying() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            if calls_for_handler.fetch_add(1, Ordering::SeqCst) == 0 {
+                http_response(503, "Service Unavailable", &[], b"")
+            } else {
+                http_response(200, "OK", &[], b"ok")
+            }
+        });
+
+        let policy = RetryPolicy::new(2)
+            .backoff(Backoff::fixed(Duration::from_millis(1)))
+            .retry_non_idempotent();
+        let resp = Client::new()
+            .post(&server.url("/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn no_retry_policy_never_retries() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            http_response(503, "Service Unavailable", &[], b"")
+        });
+
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 503);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn connection_refused_is_retried_on_a_fresh_connection() {
+    run(async {
+        // Bind to grab an ephemeral port, then immediately drop the
+        // listener -- the first connection attempt against it fails
+        // with "connection refused". A delayed task rebinds the exact
+        // same port a little later and serves one request, so the
+        // retry (not the original attempt) is what actually succeeds.
+        let listener = rusty_tokio::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        rusty_tokio::spawn(async move {
+            rusty_tokio::time::sleep(Duration::from_millis(20)).await;
+            let listener = rusty_tokio::io::TcpListener::bind(addr).unwrap();
+            if let Ok((stream, _peer)) = listener.accept().await {
+                if let Ok(_req) = common::read_request(&stream).await {
+                    let _ = stream
+                        .write_all(&http_response(200, "OK", &[], b"ok"))
+                        .await;
+                }
+            }
+        });
+
+        let policy = RetryPolicy::new(1).backoff(Backoff::fixed(Duration::from_millis(60)));
+        let resp = Client::new()
+            .get(&format!("http://{addr}/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn retry_respects_the_retry_after_header() {
+    run(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |_req| {
+            if calls_for_handler.fetch_add(1, Ordering::SeqCst) == 0 {
+                http_response(503, "Service Unavailable", &[("Retry-After", "1")], b"")
+            } else {
+                http_response(200, "OK", &[], b"ok")
+            }
+        });
+
+        // The policy's own backoff would retry near-instantly; a
+        // 1-second `Retry-After` should override it and make the whole
+        // call take at least ~1s.
+        let policy = RetryPolicy::new(1).backoff(Backoff::fixed(Duration::from_millis(1)));
+        let start = std::time::Instant::now();
+        let resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .retry(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(start.elapsed() >= Duration::from_millis(900));
     });
 }

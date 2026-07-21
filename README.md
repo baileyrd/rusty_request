@@ -75,6 +75,18 @@ not silently unsupported or half-implemented.
 - **JSON**: a small hand-rolled `Value` enum with a parser/serializer
   (`rusty_request::Json`) -- no `serde`. No derive-based mapping to
   arbitrary Rust structs; build/read `Value`s directly.
+- **Retries**: opt-in via `.retry(RetryPolicy::new(max_retries))` on
+  either `RequestBuilder` or `ClientBuilder` -- disabled by default.
+  Retries connection errors and a configurable set of response statuses
+  (429/500/502/503/504 by default), with fixed or exponential (jittered)
+  backoff (`RetryPolicy::backoff`/`Backoff`), respects a `Retry-After`
+  response header when present (capped at 60s by default so a server
+  can't stall a caller indefinitely), and only retries idempotent
+  methods (GET/HEAD/PUT/DELETE/OPTIONS) unless
+  `RetryPolicy::retry_non_idempotent()` is set -- a retried POST/PATCH
+  can otherwise duplicate a side effect the first attempt already
+  caused. The `Client`/request-level `timeout` (if set) wraps every
+  attempt and backoff sleep, not just the first one.
 
 ## Example
 
@@ -126,7 +138,6 @@ Tracked as issues in this repository:
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
 - **Multipart file uploads**.
-- **Retry/backoff**.
 - **Streaming request and response bodies** -- everything is fully
   buffered in memory today.
 - **Proxy support**.

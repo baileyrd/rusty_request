@@ -209,7 +209,7 @@ impl CookieJar {
 /// handled -- `Max-Age` is the modern, simpler-to-parse attribute and
 /// already takes precedence when both are present, so this is purely a
 /// fallback for servers that only send `Expires`.
-fn parse_http_date(s: &str) -> Option<SystemTime> {
+pub(crate) fn parse_http_date(s: &str) -> Option<SystemTime> {
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() != 6 {
         return None;
