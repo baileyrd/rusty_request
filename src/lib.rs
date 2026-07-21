@@ -13,6 +13,9 @@
 //!   convenience functions ([`get`], [`post`], ...) for one-off calls.
 //! - Response: status, headers, `.text()`/`.bytes()`/`.json()`,
 //!   `.error_for_status()`.
+//! - Auth helpers: `.basic_auth(user, pass)`/`.bearer_auth(token)` on
+//!   both `RequestBuilder` and `ClientBuilder` (RFC 7617 Basic auth
+//!   uses a small hand-rolled base64 encoder -- no `base64` crate).
 //! - `http://` only. **No HTTPS/TLS** -- hand-rolling TLS crypto is a
 //!   serious security risk to improvise in an MVP; see the README and
 //!   issue tracker for the tracked follow-up.
@@ -20,9 +23,9 @@
 //!   connection pooling/keep-alive yet.
 //!
 //! Everything else (redirects, a `Session`-style cookie jar, multipart
-//! uploads, auth helpers, retries, streaming bodies, proxies,
-//! connection reuse) is deliberately deferred -- see the README's
-//! backlog section and the repository's issue tracker.
+//! uploads, retries, streaming bodies, proxies, connection reuse) is
+//! deliberately deferred -- see the README's backlog section and the
+//! repository's issue tracker.
 //!
 //! # Example
 //!
@@ -35,6 +38,7 @@
 //! # }
 //! ```
 
+mod base64;
 mod body;
 mod client;
 mod error;

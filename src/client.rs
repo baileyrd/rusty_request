@@ -101,6 +101,24 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Sets `Authorization: Basic <base64(username:password)>` (RFC
+    /// 7617) on every request built from the resulting [`Client`],
+    /// unless a specific request overrides it with its own
+    /// `.basic_auth(...)`/`.header("Authorization", ...)` call.
+    pub fn basic_auth(mut self, username: &str, password: &str) -> Result<Self> {
+        self.default_headers
+            .insert("Authorization", &basic_auth_header(username, password))?;
+        Ok(self)
+    }
+
+    /// Sets `Authorization: Bearer <token>` on every request built from
+    /// the resulting [`Client`], unless a specific request overrides it.
+    pub fn bearer_auth(mut self, token: &str) -> Result<Self> {
+        self.default_headers
+            .insert("Authorization", &format!("Bearer {token}"))?;
+        Ok(self)
+    }
+
     /// The per-request timeout applied unless a request sets its own.
     /// Default is 30 seconds; see [`ClientBuilder::no_timeout`] to
     /// disable it entirely.
@@ -139,6 +157,27 @@ pub struct RequestBuilder {
 impl RequestBuilder {
     pub fn header(mut self, name: &str, value: &str) -> Result<Self> {
         self.headers.insert(name, value)?;
+        Ok(self)
+    }
+
+    /// Sets `Authorization: Basic <base64(username:password)>` (RFC
+    /// 7617) on this request, overriding any `Authorization` set at the
+    /// `Client` level.
+    ///
+    /// The URL parser deliberately rejects `user:pass@host` userinfo
+    /// syntax (see `src/url.rs`) -- this and [`RequestBuilder::bearer_auth`]
+    /// are the supported way to set credentials for now.
+    pub fn basic_auth(mut self, username: &str, password: &str) -> Result<Self> {
+        self.headers
+            .insert("Authorization", &basic_auth_header(username, password))?;
+        Ok(self)
+    }
+
+    /// Sets `Authorization: Bearer <token>` on this request, overriding
+    /// any `Authorization` set at the `Client` level.
+    pub fn bearer_auth(mut self, token: &str) -> Result<Self> {
+        self.headers
+            .insert("Authorization", &format!("Bearer {token}"))?;
         Ok(self)
     }
 
@@ -235,6 +274,13 @@ impl RequestBuilder {
             None => fut.await,
         }
     }
+}
+
+fn basic_auth_header(username: &str, password: &str) -> String {
+    format!(
+        "Basic {}",
+        crate::base64::encode(format!("{username}:{password}").as_bytes())
+    )
 }
 
 async fn send_over_new_connection(request: &Request) -> Result<Response> {
