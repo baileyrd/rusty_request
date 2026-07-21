@@ -8,6 +8,7 @@ use crate::method::Method;
 use crate::pool::{ConnectionPool, PoolKey};
 use crate::request::Request;
 use crate::response::Response;
+use crate::retry::RetryPolicy;
 use crate::url::{percent_encode, Url};
 use rusty_tokio::io::TcpStream;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -43,6 +44,7 @@ pub struct Client {
     redirect_policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl Client {
@@ -65,6 +67,7 @@ impl Client {
             redirect_policy: self.redirect_policy,
             cookie_jar: self.cookie_jar.clone(),
             pool: self.pool.clone(),
+            retry_policy: self.retry_policy.clone(),
         })
     }
 
@@ -107,6 +110,7 @@ pub struct ClientBuilder {
     pool_max_idle_per_host: usize,
     pool_idle_timeout: Duration,
     pool_enabled: bool,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl ClientBuilder {
@@ -123,6 +127,7 @@ impl ClientBuilder {
             pool_max_idle_per_host: DEFAULT_MAX_IDLE_PER_HOST,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
             pool_enabled: true,
+            retry_policy: None,
         }
     }
 
@@ -219,6 +224,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Enables automatic retries for requests built from the resulting
+    /// [`Client`], governed by `policy`. Disabled by default -- see
+    /// [`crate::RetryPolicy`] for what a retry does and doesn't cover.
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Disables automatic retries -- the default; only useful to
+    /// override a previously-set policy earlier in the same builder
+    /// chain.
+    pub fn no_retry(mut self) -> Self {
+        self.retry_policy = None;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
@@ -231,6 +252,7 @@ impl ClientBuilder {
                     self.pool_idle_timeout,
                 ))
             }),
+            retry_policy: self.retry_policy,
         }
     }
 }
@@ -250,6 +272,7 @@ pub struct RequestBuilder {
     redirect_policy: RedirectPolicy,
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     pool: Option<Arc<ConnectionPool>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl RequestBuilder {
@@ -348,6 +371,20 @@ impl RequestBuilder {
         self
     }
 
+    /// Enables automatic retries for this request, governed by `policy`,
+    /// overriding the `Client`'s default. See [`RetryPolicy`].
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Disables automatic retries for this request, overriding the
+    /// `Client`'s default.
+    pub fn no_retry(mut self) -> Self {
+        self.retry_policy = None;
+        self
+    }
+
     pub async fn send(self) -> Result<Response> {
         let RequestBuilder {
             method,
@@ -358,9 +395,10 @@ impl RequestBuilder {
             redirect_policy,
             cookie_jar,
             pool,
+            retry_policy,
         } = self;
 
-        let fut = send_with_redirects(
+        let fut = send_with_retries(
             method,
             url,
             headers,
@@ -368,6 +406,7 @@ impl RequestBuilder {
             redirect_policy,
             cookie_jar,
             pool,
+            retry_policy,
         );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
@@ -376,6 +415,65 @@ impl RequestBuilder {
             },
             None => fut.await,
         }
+    }
+}
+
+/// Sends the request, retrying per `retry_policy` (if any) on top of
+/// following redirects. The overall timeout (if any) wraps every attempt
+/// and every backoff sleep, same as it already wraps a whole redirect
+/// chain -- otherwise retries could let a request run well past its
+/// configured deadline.
+#[allow(clippy::too_many_arguments)]
+async fn send_with_retries(
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    body: Body,
+    redirect_policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool: Option<Arc<ConnectionPool>>,
+    retry_policy: Option<RetryPolicy>,
+) -> Result<Response> {
+    let Some(policy) = retry_policy else {
+        return send_with_redirects(
+            method,
+            url,
+            headers,
+            body,
+            redirect_policy,
+            cookie_jar,
+            pool,
+        )
+        .await;
+    };
+
+    let mut attempt = 0usize;
+    loop {
+        let result = send_with_redirects(
+            method,
+            url.clone(),
+            headers.clone(),
+            body.clone(),
+            redirect_policy,
+            cookie_jar.clone(),
+            pool.clone(),
+        )
+        .await;
+
+        let (should_retry, retry_after) = match &result {
+            Ok(response) => (
+                policy.should_retry_status(response.status().as_u16()),
+                policy.retry_after(response.headers()),
+            ),
+            Err(e) => (policy.should_retry_error(e), None),
+        };
+
+        if !should_retry || !policy.allows_method(method) || attempt >= policy.max_retries() {
+            return result;
+        }
+
+        rusty_tokio::time::sleep(policy.delay_for(attempt, retry_after)).await;
+        attempt += 1;
     }
 }
 

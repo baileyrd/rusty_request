@@ -36,10 +36,16 @@
 //!   bounded by a per-origin idle cap and timeout, with a stale pooled
 //!   connection transparently retried once on a fresh connection.
 //!   `ClientBuilder::no_pool` opts out.
+//! - Retries: opt-in via `ClientBuilder::retry`/`RequestBuilder::retry`
+//!   with a [`RetryPolicy`] -- connection errors and a configurable set
+//!   of statuses (429/500/502/503/504 by default), fixed or exponential
+//!   (with jitter) backoff, `Retry-After` respected and capped, and only
+//!   idempotent methods retried unless explicitly opted into for
+//!   POST/PATCH too. Disabled by default.
 //!
-//! Everything else (multipart uploads, retries, streaming bodies,
-//! proxies) is deliberately deferred -- see the README's backlog
-//! section and the repository's issue tracker.
+//! Everything else (multipart uploads, streaming bodies, proxies) is
+//! deliberately deferred -- see the README's backlog section and the
+//! repository's issue tracker.
 //!
 //! # Example
 //!
@@ -64,6 +70,7 @@ mod method;
 mod pool;
 mod request;
 mod response;
+mod retry;
 mod status;
 mod url;
 
@@ -75,6 +82,7 @@ pub use json::Value as Json;
 pub use method::Method;
 pub use request::Request;
 pub use response::Response;
+pub use retry::{Backoff, RetryPolicy};
 pub use status::StatusCode;
 pub use url::Url;
 
