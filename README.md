@@ -94,6 +94,20 @@ not silently unsupported or half-implemented.
   `Multipart::file(name, filename, bytes)` /
   `Multipart::file_with_content_type(...)` for file parts. Fully
   buffered in memory today, like every other request body.
+- **Streaming bodies**: `Body::streaming(len, open)` builds a request
+  body from an `AsyncRead` factory (`open` is called fresh for the
+  first attempt, and again for any 307/308 redirect hop that preserves
+  the body -- a single already-open reader can't be rewound or
+  duplicated for a second hop). `len: Some(n)` sends `Content-Length`
+  and streams the bytes as-is; `None` sends `Transfer-Encoding: chunked`
+  for a source whose size isn't known upfront.
+  `RequestBuilder::send_streaming()` mirrors this on the response side:
+  returns as soon as the status/headers arrive, then pull the body
+  incrementally via `StreamingResponse::chunk()` instead of buffering
+  it all first -- redirects are still followed exactly like `.send()`.
+  Two first-pass scope boundaries (documented on `send_streaming`): any
+  configured `RetryPolicy` is ignored, and the connection used isn't
+  returned to the pool afterward.
 
 ## Example
 
@@ -144,8 +158,6 @@ Tracked as issues in this repository:
 - **HTTPS/TLS support** -- needs a dedicated, carefully-reviewed effort
   (likely a `rustils` Security-surface addition, or FFI into an OS TLS
   library), not something bolted on here.
-- **Streaming request and response bodies** -- everything is fully
-  buffered in memory today.
 - **Proxy support**.
 
 ## Testing

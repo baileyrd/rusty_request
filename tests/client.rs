@@ -1,7 +1,7 @@
 mod common;
 
-use common::{http_chunked_response, http_response, run, start_test_server};
-use rusty_request::{Backoff, Client, Error, Json, Multipart, RetryPolicy};
+use common::{http_chunked_response, http_response, run, start_test_server, MemoryReader};
+use rusty_request::{Backoff, Body, Client, Error, Json, Multipart, RetryPolicy};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +104,187 @@ fn multipart_upload_reaches_the_server_with_a_matching_boundary_and_parts() {
             .unwrap();
 
         assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn streaming_request_body_with_known_length_uses_content_length() {
+    run(async {
+        let payload = vec![b'x'; 20_000];
+        let expected = payload.clone();
+        let server = start_test_server(move |req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.header("content-length"), Some("20000"));
+            assert!(req.header("transfer-encoding").is_none());
+            assert_eq!(req.body, expected);
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let data = payload.clone();
+        let body = Body::streaming(Some(data.len() as u64), move || {
+            MemoryReader::new(data.clone(), 777)
+        });
+
+        let resp = Client::new()
+            .post(&server.url("/"))
+            .unwrap()
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn streaming_request_body_with_unknown_length_uses_chunked_encoding() {
+    run(async {
+        let payload = vec![b'y'; 20_000];
+        let expected = payload.clone();
+        let server = start_test_server(move |req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.header("transfer-encoding"), Some("chunked"));
+            assert!(req.header("content-length").is_none());
+            assert_eq!(req.body, expected);
+            http_response(200, "OK", &[], b"ok")
+        });
+
+        let data = payload.clone();
+        let body = Body::streaming(None, move || MemoryReader::new(data.clone(), 777));
+
+        let resp = Client::new()
+            .post(&server.url("/"))
+            .unwrap()
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+    });
+}
+
+#[test]
+fn streaming_request_body_is_reopened_for_a_preserved_redirect_hop() {
+    run(async {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let server = start_test_server(move |req| {
+            assert_eq!(req.body, b"reopen me");
+            if calls_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                http_response(307, "Temporary Redirect", &[("Location", "/next")], b"")
+            } else {
+                http_response(200, "OK", &[], b"ok")
+            }
+        });
+
+        let body = Body::streaming(Some(9), || MemoryReader::new(b"reopen me".to_vec(), 3));
+
+        let resp = Client::new()
+            .post(&server.url("/first"))
+            .unwrap()
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn send_streaming_reassembles_a_content_length_response() {
+    run(async {
+        let server =
+            start_test_server(|_req| http_response(200, "OK", &[], b"hello streamed world"));
+
+        let mut resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .send_streaming()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let mut collected = Vec::new();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, b"hello streamed world");
+    });
+}
+
+#[test]
+fn send_streaming_reassembles_a_chunked_response() {
+    run(async {
+        let server = start_test_server(|_req| {
+            http_chunked_response(200, "OK", &[], &[b"hello, ", b"chunked ", b"world"])
+        });
+
+        let mut resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .send_streaming()
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, b"hello, chunked world");
+    });
+}
+
+#[test]
+fn send_streaming_reassembles_a_close_delimited_response() {
+    run(async {
+        let server = start_test_server(|_req| {
+            b"HTTP/1.1 200 OK\r\nX-No-Length: true\r\n\r\nno content-length, no chunking".to_vec()
+        });
+
+        let mut resp = Client::new()
+            .get(&server.url("/"))
+            .unwrap()
+            .send_streaming()
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, b"no content-length, no chunking");
+    });
+}
+
+#[test]
+fn send_streaming_follows_redirects_to_the_final_hop() {
+    run(async {
+        let server = start_test_server(|req| {
+            if req.target == "/start" {
+                http_response(302, "Found", &[("Location", "/end")], b"")
+            } else {
+                http_response(200, "OK", &[], b"streamed after redirect")
+            }
+        });
+
+        let mut resp = Client::new()
+            .get(&server.url("/start"))
+            .unwrap()
+            .send_streaming()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.url().path, "/end");
+        let mut collected = Vec::new();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, b"streamed after redirect");
     });
 }
 

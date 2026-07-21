@@ -10,6 +10,8 @@ use crate::pool::{ConnectionPool, PoolKey};
 use crate::request::Request;
 use crate::response::Response;
 use crate::retry::RetryPolicy;
+use crate::status::StatusCode;
+use crate::streaming::StreamingResponse;
 use crate::url::{percent_encode, Url};
 use rusty_tokio::io::TcpStream;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -426,6 +428,58 @@ impl RequestBuilder {
             None => fut.await,
         }
     }
+
+    /// Like [`RequestBuilder::send`], but returns as soon as the status
+    /// line and headers arrive instead of buffering the whole body
+    /// first -- pull it incrementally via [`StreamingResponse::chunk`].
+    /// Follows redirects exactly like `.send()` does (each redirect
+    /// hop's own body is still read and discarded eagerly, same as
+    /// before; only the final, returned response is left unread).
+    ///
+    /// Two differences from `.send()`, both deliberate first-pass
+    /// scope boundaries (see the streaming-bodies issue): any
+    /// configured [`RetryPolicy`] is ignored -- retrying a request whose
+    /// body may itself be a single-use stream isn't supported yet -- and
+    /// the connection used for the final hop is never returned to the
+    /// pool afterward, since whether it's still safe to reuse isn't
+    /// known until the body has been fully drained, which this first
+    /// pass doesn't track. A pooled connection is still tried first
+    /// for the request itself, same as `.send()`.
+    ///
+    /// The configured timeout, if any, only bounds getting to the
+    /// `StreamingResponse` (through any redirects) -- not each
+    /// subsequent `.chunk()` call, since those happen after this method
+    /// has already returned.
+    pub async fn send_streaming(self) -> Result<StreamingResponse> {
+        let RequestBuilder {
+            method,
+            url,
+            headers,
+            body,
+            timeout: request_timeout,
+            redirect_policy,
+            cookie_jar,
+            pool,
+            retry_policy: _,
+        } = self;
+
+        let fut = send_with_redirects_streaming(
+            method,
+            url,
+            headers,
+            body,
+            redirect_policy,
+            cookie_jar,
+            pool,
+        );
+        match request_timeout {
+            Some(d) => match rusty_tokio::time::timeout(d, fut).await {
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(Error::Timeout),
+            },
+            None => fut.await,
+        }
+    }
 }
 
 /// Sends the request, retrying per `retry_policy` (if any) on top of
@@ -507,34 +561,8 @@ async fn send_with_redirects(
             return Err(Error::UnsupportedScheme(url.scheme));
         }
 
-        let mut wire_headers = hop_headers.clone();
-        if !wire_headers.contains("Accept") {
-            wire_headers.insert("Accept", "*/*")?;
-        }
-        // Attach any cookies the jar has for this origin/path, merging
-        // with (rather than overriding) a caller-set `Cookie` header.
-        // Looked up fresh every hop since the jar's contents can change
-        // between hops (a redirect response can itself set cookies).
-        if let Some(jar) = &cookie_jar {
-            let jar_cookies = jar.lock().unwrap().cookie_header_for(&url);
-            if let Some(jar_cookies) = jar_cookies {
-                let merged = match wire_headers.get("Cookie") {
-                    Some(existing) => format!("{existing}; {jar_cookies}"),
-                    None => jar_cookies,
-                };
-                wire_headers.insert("Cookie", &merged)?;
-            }
-        }
-        // With pooling disabled, say so honestly on the wire too. With
-        // it enabled, HTTP/1.1's persistent-by-default behavior applies
-        // -- no explicit header needed, and a caller's own `Connection`
-        // header (if any) is left alone.
-        if pool.is_none() {
-            wire_headers.insert("Connection", "close")?;
-        }
-        // Always computed from the real body, never trusted from a
-        // caller-supplied header.
-        wire_headers.insert("Content-Length", &body.as_bytes().len().to_string())?;
+        let wire_headers =
+            build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
 
         let request = Request {
             method,
@@ -600,6 +628,154 @@ async fn send_with_redirects(
     }
 }
 
+/// Builds the headers actually sent on the wire for one hop: a default
+/// `Accept`, any jar cookies merged with a caller-set `Cookie` header,
+/// `Connection: close` when pooling is disabled, and `Content-Length` or
+/// `Transfer-Encoding: chunked` depending on whether `body`'s length is
+/// known upfront. Shared by the buffered and streaming send paths.
+fn build_wire_headers(
+    hop_headers: &HeaderMap,
+    cookie_jar: &Option<Arc<Mutex<CookieJar>>>,
+    url: &Url,
+    pooling_enabled: bool,
+    body: &Body,
+) -> Result<HeaderMap> {
+    let mut wire_headers = hop_headers.clone();
+    if !wire_headers.contains("Accept") {
+        wire_headers.insert("Accept", "*/*")?;
+    }
+    // Attach any cookies the jar has for this origin/path, merging with
+    // (rather than overriding) a caller-set `Cookie` header. Looked up
+    // fresh every hop since the jar's contents can change between hops
+    // (a redirect response can itself set cookies).
+    if let Some(jar) = cookie_jar {
+        let jar_cookies = jar.lock().unwrap().cookie_header_for(url);
+        if let Some(jar_cookies) = jar_cookies {
+            let merged = match wire_headers.get("Cookie") {
+                Some(existing) => format!("{existing}; {jar_cookies}"),
+                None => jar_cookies,
+            };
+            wire_headers.insert("Cookie", &merged)?;
+        }
+    }
+    // With pooling disabled, say so honestly on the wire too. With it
+    // enabled, HTTP/1.1's persistent-by-default behavior applies -- no
+    // explicit header needed, and a caller's own `Connection` header
+    // (if any) is left alone.
+    if !pooling_enabled {
+        wire_headers.insert("Connection", "close")?;
+    }
+    // Always computed from the real body, never trusted from a
+    // caller-supplied header. A body whose length isn't known upfront
+    // (a `Body::Stream` built without one) falls back to chunked
+    // framing instead.
+    match body.content_length() {
+        Some(len) => {
+            wire_headers.insert("Content-Length", &len.to_string())?;
+        }
+        None => {
+            wire_headers.insert("Transfer-Encoding", "chunked")?;
+        }
+    }
+    Ok(wire_headers)
+}
+
+/// Like [`send_with_redirects`], but leaves the final (non-redirect)
+/// hop's body unread instead of buffering it -- see
+/// [`RequestBuilder::send_streaming`]. Every intermediate redirect hop's
+/// body is still fully drained (and discarded) before moving to the
+/// next hop, the same as the buffered path does implicitly by always
+/// reading eagerly -- there's no way to know a hop is a redirect (and
+/// therefore not the one to hand back to the caller) until after its
+/// status/headers have already arrived, so every hop uses the streaming
+/// read path and only redirect hops get drained afterward.
+async fn send_with_redirects_streaming(
+    mut method: Method,
+    mut url: Url,
+    headers: HeaderMap,
+    mut body: Body,
+    policy: RedirectPolicy,
+    cookie_jar: Option<Arc<Mutex<CookieJar>>>,
+    pool: Option<Arc<ConnectionPool>>,
+) -> Result<StreamingResponse> {
+    let mut hop_headers = headers;
+    let mut hop = 0usize;
+
+    loop {
+        if url.scheme != "http" {
+            return Err(Error::UnsupportedScheme(url.scheme));
+        }
+
+        let wire_headers =
+            build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
+
+        let request = Request {
+            method,
+            url: url.clone(),
+            headers: wire_headers,
+            body: body.clone(),
+            timeout: None,
+        };
+        let (status, resp_headers, mut streaming_body) =
+            send_one_hop_streaming(pool.as_deref(), &request).await?;
+
+        if let Some(jar) = &cookie_jar {
+            let set_cookie_values: Vec<&str> = resp_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, value)| value)
+                .collect();
+            if !set_cookie_values.is_empty() {
+                jar.lock()
+                    .unwrap()
+                    .store_from_response(&url, set_cookie_values.into_iter());
+            }
+        }
+
+        if !is_redirect_status(status.as_u16()) {
+            return Ok(StreamingResponse::new(
+                status,
+                resp_headers,
+                url,
+                streaming_body,
+            ));
+        }
+        let RedirectPolicy::Follow(max) = policy else {
+            return Ok(StreamingResponse::new(
+                status,
+                resp_headers,
+                url,
+                streaming_body,
+            ));
+        };
+        if hop >= max {
+            return Err(Error::TooManyRedirects(max));
+        }
+
+        // This hop won't be returned to the caller -- drain and discard
+        // its body before moving to the next hop.
+        while streaming_body.next_chunk().await?.is_some() {}
+
+        let location = resp_headers
+            .get("location")
+            .ok_or_else(|| {
+                Error::InvalidResponse(format!("{status} redirect response had no Location header"))
+            })?
+            .to_string();
+        let next_url = url.resolve_redirect(&location)?;
+
+        let cross_origin =
+            !next_url.host.eq_ignore_ascii_case(&url.host) || next_url.port != url.port;
+        if cross_origin {
+            hop_headers.remove("Authorization");
+        }
+
+        (method, body) = redirect_method_and_body(status.as_u16(), method, body);
+        url = next_url;
+        hop += 1;
+    }
+}
+
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -633,14 +809,29 @@ fn pool_key(url: &Url) -> PoolKey {
     (url.scheme.clone(), url.host.to_ascii_lowercase(), url.port)
 }
 
-async fn attempt(stream: &TcpStream, request: &Request) -> Result<http1::RawResponse> {
+async fn attempt(stream: TcpStream, request: &Request) -> Result<http1::RawResponse> {
     http1::send_request(
         stream,
         request.method,
         &request.url.request_target(),
         &request.url.host_header(),
         &request.headers,
-        request.body.as_bytes(),
+        &request.body,
+    )
+    .await
+}
+
+async fn attempt_streaming(
+    stream: TcpStream,
+    request: &Request,
+) -> Result<http1::StreamingRawResponse> {
+    http1::send_request_streaming(
+        stream,
+        request.method,
+        &request.url.request_target(),
+        &request.url.host_header(),
+        &request.headers,
+        &request.body,
     )
     .await
 }
@@ -658,9 +849,9 @@ async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Resul
 
     if let Some(pool) = pool {
         if let Some(stream) = pool.take(&key) {
-            if let Ok(raw) = attempt(&stream, request).await {
+            if let Ok(raw) = attempt(stream, request).await {
                 if raw.keep_alive {
-                    pool.put(key, stream);
+                    pool.put(key, raw.stream);
                 }
                 return Ok(Response::new(
                     raw.status,
@@ -674,10 +865,10 @@ async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Resul
 
     let addrs = resolve(request.url.host.clone(), request.url.port).await?;
     let stream = connect(&addrs).await?;
-    let raw = attempt(&stream, request).await?;
+    let raw = attempt(stream, request).await?;
     if raw.keep_alive {
         if let Some(pool) = pool {
-            pool.put(key, stream);
+            pool.put(key, raw.stream);
         }
     }
     Ok(Response::new(
@@ -686,6 +877,32 @@ async fn send_one_hop(pool: Option<&ConnectionPool>, request: &Request) -> Resul
         request.url.clone(),
         raw.body,
     ))
+}
+
+/// Like [`send_one_hop`], but leaves the body unread -- see
+/// [`http1::send_request_streaming`]. The connection is never returned
+/// to the pool afterward (deliberate; see
+/// [`RequestBuilder::send_streaming`]'s docs), though a pooled one is
+/// still tried first and falls back to a fresh connection on failure,
+/// same as the buffered path.
+async fn send_one_hop_streaming(
+    pool: Option<&ConnectionPool>,
+    request: &Request,
+) -> Result<(StatusCode, HeaderMap, http1::StreamingBody)> {
+    let key = pool_key(&request.url);
+
+    if let Some(pool) = pool {
+        if let Some(stream) = pool.take(&key) {
+            if let Ok(raw) = attempt_streaming(stream, request).await {
+                return Ok((raw.status, raw.headers, raw.body));
+            }
+        }
+    }
+
+    let addrs = resolve(request.url.host.clone(), request.url.port).await?;
+    let stream = connect(&addrs).await?;
+    let raw = attempt_streaming(stream, request).await?;
+    Ok((raw.status, raw.headers, raw.body))
 }
 
 /// DNS resolution is a blocking OS call (`getaddrinfo` under the hood);

@@ -119,26 +119,37 @@ pub async fn read_request(stream: &TcpStream) -> std::io::Result<TestRequest> {
 
     let mut headers = Vec::new();
     let mut content_length = 0usize;
+    let mut is_chunked = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let k = k.trim().to_string();
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("transfer-encoding")
+                && v.eq_ignore_ascii_case("chunked")
+            {
+                is_chunked = true;
             }
             headers.push((k, v));
         }
     }
 
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
+    let leftover = buf[header_end + 4..].to_vec();
+    let body = if is_chunked {
+        read_chunked_request_body(stream, leftover, 0).await?
+    } else {
+        let mut body = leftover;
+        while body.len() < content_length {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
         }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
+        body.truncate(content_length);
+        body
+    };
 
     Ok(TestRequest {
         method,
@@ -146,6 +157,75 @@ pub async fn read_request(stream: &TcpStream) -> std::io::Result<TestRequest> {
         headers,
         body,
     })
+}
+
+/// Decodes a `Transfer-Encoding: chunked` request body: `leftover` is
+/// whatever body bytes already arrived in the same read(s) as the
+/// headers; more is pulled from `stream` as needed until the
+/// zero-size terminating chunk (and any trailers) is seen.
+async fn read_chunked_request_body(
+    stream: &TcpStream,
+    mut buf: Vec<u8>,
+    mut pos: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut chunk = [0u8; 4096];
+    let mut out = Vec::new();
+
+    async fn next_line(
+        stream: &TcpStream,
+        buf: &mut Vec<u8>,
+        pos: usize,
+        chunk: &mut [u8],
+    ) -> std::io::Result<usize> {
+        loop {
+            if let Some(rel) = find_subslice(&buf[pos..], b"\r\n") {
+                return Ok(pos + rel);
+            }
+            let n = stream.read(chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed mid chunked body",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    loop {
+        let line_end = next_line(stream, &mut buf, pos, &mut chunk).await?;
+        let size_str = String::from_utf8_lossy(&buf[pos..line_end]).into_owned();
+        let size =
+            usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
+        pos = line_end + 2;
+
+        if size == 0 {
+            loop {
+                let trailer_end = next_line(stream, &mut buf, pos, &mut chunk).await?;
+                let is_blank = trailer_end == pos;
+                pos = trailer_end + 2;
+                if is_blank {
+                    break;
+                }
+            }
+            break;
+        }
+
+        while buf.len() < pos + size + 2 {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed mid chunk data",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        out.extend_from_slice(&buf[pos..pos + size]);
+        pos += size + 2;
+    }
+
+    Ok(out)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -225,4 +305,41 @@ pub fn http_chunked_response(
     }
     out.extend_from_slice(b"0\r\n\r\n");
     out
+}
+
+/// A minimal in-memory `AsyncRead` source for building [`rusty_request::Body::streaming`]
+/// bodies in tests -- hands back at most `step` bytes per `poll_read`
+/// call, so a payload larger than `step` forces the client's writer (and,
+/// for a response body, `StreamingBody`'s reader) through more than one
+/// read/write round trip instead of moving everything in one shot.
+pub struct MemoryReader {
+    data: Vec<u8>,
+    pos: usize,
+    step: usize,
+}
+
+impl MemoryReader {
+    pub fn new(data: impl Into<Vec<u8>>, step: usize) -> Self {
+        MemoryReader {
+            data: data.into(),
+            pos: 0,
+            step: step.max(1),
+        }
+    }
+}
+
+impl rusty_tokio::io::AsyncRead for MemoryReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut rusty_tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let remaining = &this.data[this.pos..];
+        let n = remaining.len().min(buf.unfilled_mut().len()).min(this.step);
+        buf.unfilled_mut()[..n].copy_from_slice(&remaining[..n]);
+        buf.advance(n);
+        this.pos += n;
+        std::task::Poll::Ready(Ok(()))
+    }
 }
