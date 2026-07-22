@@ -1,11 +1,17 @@
 # rusty_request
 
-An async, hand-rolled HTTP client for Rust -- a take on Python's
-`requests`, built on our own from-scratch async runtime
+An async HTTP client for Rust -- a take on Python's `requests`, built on
+our own from-scratch async runtime
 ([`rusty_tokio`](https://github.com/baileyrd/rusty_tokio)) instead of
-`tokio`. Everything above the raw socket -- URL parsing, HTTP/1.1
-request/response framing, JSON -- is original code in this crate: no
-`hyper`, no `reqwest`, no `serde`, no `url` crate.
+`tokio`. URL parsing, HTTP/1.1 request/response framing, and the RFC
+6265 cookie jar come from
+[`rusty_http`](https://github.com/baileyrd/rusty_http), the rusty
+ecosystem's one shared HTTP/1.1 message layer and `Url` type --
+[`rusty_tail`](https://github.com/baileyrd/rusty_tail) is the other
+consumer, using the same crate for its ts2021/DERP protocol upgrades and
+its LocalAPI client/server. This crate's own connection pooling,
+retry/redirect policy, proxy routing, and JSON are still original code:
+no `hyper`, no `reqwest`, no `serde`, no `url` crate.
 
 ## TLS/HTTPS
 
