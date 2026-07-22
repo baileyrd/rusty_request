@@ -4,10 +4,9 @@
 //! all in memory at once.
 
 use crate::error::Result;
-use crate::header::HeaderMap;
-use crate::http1::StreamingBody;
-use crate::status::StatusCode;
-use crate::url::Url;
+use crate::stream::Conn;
+use rusty_http::async_tokio::BodyReader;
+use rusty_http::{HeaderMap, StatusCode, Url};
 
 /// A response whose body hasn't been read yet. Unlike [`crate::Response`]
 /// (always fully buffered), the body here is pulled incrementally via
@@ -18,7 +17,7 @@ pub struct StreamingResponse {
     status: StatusCode,
     headers: HeaderMap,
     url: Url,
-    body: StreamingBody,
+    body: BodyReader<Conn>,
 }
 
 impl StreamingResponse {
@@ -26,7 +25,7 @@ impl StreamingResponse {
         status: StatusCode,
         headers: HeaderMap,
         url: Url,
-        body: StreamingBody,
+        body: BodyReader<Conn>,
     ) -> Self {
         StreamingResponse {
             status,
@@ -60,6 +59,6 @@ impl StreamingResponse {
     /// see [`crate::RequestBuilder::send_streaming`]'s docs) rather than
     /// leaving anything to clean up.
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        self.body.next_chunk().await
+        Ok(self.body.next_chunk().await?)
     }
 }

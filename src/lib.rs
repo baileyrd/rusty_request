@@ -1,10 +1,13 @@
-//! `rusty_request` -- an async, hand-rolled HTTP client in the spirit of
-//! Python's `requests`, built on [`rusty_tokio`] (our own from-scratch
-//! async runtime) and [`rusty_tls`](https://github.com/baileyrd/rusty_tls)
-//! (the ecosystem's one shared TLS implementation and trust policy).
-//! Everything above the raw socket -- URL parsing, HTTP/1.1
-//! request/response framing, and JSON -- is original code in this
-//! crate; no `hyper`, no `reqwest`, no `serde`, no `url` crate.
+//! `rusty_request` -- an async HTTP client in the spirit of Python's
+//! `requests`, built on [`rusty_tokio`] (our own from-scratch async
+//! runtime), [`rusty_tls`](https://github.com/baileyrd/rusty_tls) (the
+//! ecosystem's one shared TLS implementation and trust policy), and
+//! [`rusty_http`](https://github.com/baileyrd/rusty_http) (the
+//! ecosystem's one shared HTTP/1.1 message layer and `Url` type). URL
+//! parsing, HTTP/1.1 request/response framing, and the RFC 6265 cookie
+//! jar all come from `rusty_http` now -- this crate's own connection
+//! pooling, retry/redirect policy, proxy routing, and JSON are still
+//! original code; no `hyper`, no `reqwest`, no `serde`, no `url` crate.
 //!
 //! # MVP scope
 //!
@@ -84,12 +87,8 @@
 mod base64;
 mod body;
 mod client;
-mod cookie;
 mod error;
-mod header;
-mod http1;
 mod json;
-mod method;
 mod multipart;
 mod pool;
 mod proxy;
@@ -97,25 +96,20 @@ mod rand;
 mod request;
 mod response;
 mod retry;
-mod status;
 mod stream;
 mod streaming;
-mod url;
 
 pub use body::Body;
 pub use client::{Client, ClientBuilder, RequestBuilder};
 pub use error::{Error, Result};
-pub use header::HeaderMap;
 pub use json::Value as Json;
-pub use method::Method;
 pub use multipart::Multipart;
 pub use proxy::Proxy;
 pub use request::Request;
 pub use response::Response;
 pub use retry::{Backoff, RetryPolicy};
-pub use status::StatusCode;
+pub use rusty_http::{HeaderMap, Method, StatusCode, Url};
 pub use streaming::StreamingResponse;
-pub use url::Url;
 
 /// `GET url` via a fresh, default [`Client`]. For repeated requests
 /// (shared headers, a shared timeout, connection reuse, cookies),

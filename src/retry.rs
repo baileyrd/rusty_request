@@ -6,10 +6,9 @@
 //! needs a second, explicit opt-in too (see
 //! [`RetryPolicy::retry_non_idempotent`]).
 
-use crate::cookie::parse_http_date;
 use crate::error::Error;
-use crate::header::HeaderMap;
-use crate::method::Method;
+use rusty_http::cookie::parse_http_date;
+use rusty_http::{HeaderMap, Method};
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_RETRY_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
@@ -168,7 +167,7 @@ impl RetryPolicy {
         self.max_retries
     }
 
-    pub(crate) fn allows_method(&self, method: Method) -> bool {
+    pub(crate) fn allows_method(&self, method: &Method) -> bool {
         self.retry_non_idempotent
             || matches!(
                 method,
@@ -263,18 +262,18 @@ mod tests {
     #[test]
     fn default_policy_only_allows_idempotent_methods() {
         let policy = RetryPolicy::new(3);
-        assert!(policy.allows_method(Method::Get));
-        assert!(policy.allows_method(Method::Put));
-        assert!(policy.allows_method(Method::Delete));
-        assert!(!policy.allows_method(Method::Post));
-        assert!(!policy.allows_method(Method::Patch));
+        assert!(policy.allows_method(&Method::Get));
+        assert!(policy.allows_method(&Method::Put));
+        assert!(policy.allows_method(&Method::Delete));
+        assert!(!policy.allows_method(&Method::Post));
+        assert!(!policy.allows_method(&Method::Patch));
     }
 
     #[test]
     fn retry_non_idempotent_allows_post_and_patch() {
         let policy = RetryPolicy::new(3).retry_non_idempotent();
-        assert!(policy.allows_method(Method::Post));
-        assert!(policy.allows_method(Method::Patch));
+        assert!(policy.allows_method(&Method::Post));
+        assert!(policy.allows_method(&Method::Patch));
     }
 
     #[test]

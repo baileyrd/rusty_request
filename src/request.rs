@@ -1,7 +1,5 @@
 use crate::body::Body;
-use crate::header::HeaderMap;
-use crate::method::Method;
-use crate::url::Url;
+use rusty_http::{HeaderMap, Method, Url};
 use std::time::Duration;
 
 /// A fully-assembled request, ready to send. Built via
@@ -18,7 +16,7 @@ pub struct Request {
 
 impl Request {
     pub fn method(&self) -> Method {
-        self.method
+        self.method.clone()
     }
 
     pub fn url(&self) -> &Url {

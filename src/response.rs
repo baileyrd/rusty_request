@@ -1,8 +1,6 @@
 use crate::error::{Error, Result};
-use crate::header::HeaderMap;
 use crate::json;
-use crate::status::StatusCode;
-use crate::url::Url;
+use rusty_http::{HeaderMap, StatusCode, Url};
 
 #[derive(Debug, Clone)]
 pub struct Response {
