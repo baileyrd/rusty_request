@@ -1,24 +1,39 @@
 use crate::body::Body;
-use crate::cookie::CookieJar;
 use crate::error::{Error, Result};
-use crate::header::HeaderMap;
-use crate::http1;
 use crate::json;
-use crate::method::Method;
 use crate::multipart::Multipart;
 use crate::pool::{ConnectionPool, PoolKey};
 use crate::proxy::{NoProxyRules, Proxy};
 use crate::request::Request;
 use crate::response::Response;
 use crate::retry::RetryPolicy;
-use crate::status::StatusCode;
 use crate::stream::Conn;
 use crate::streaming::StreamingResponse;
-use crate::url::{percent_encode, Url};
-use rusty_tokio::io::TcpStream;
+use rusty_http::async_tokio::{AsyncTransport, BodyReader};
+use rusty_http::body::{self, Framing};
+use rusty_http::cookie::CookieJar;
+use rusty_http::head::RequestHead;
+use rusty_http::url::percent_encode;
+use rusty_http::{HeaderMap, Method, StatusCode, Url, Version};
+use rusty_tokio::io::{AsyncReadExt, TcpStream};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Bytes at a time a streaming request body ([`Body::Stream`]) is relayed
+/// onto the wire per read -- also the max response head size a server
+/// this crate deliberately connected to is trusted to send within (see
+/// [`MAX_RESPONSE_HEAD_LEN`]'s own doc for why that's a larger bound
+/// than `rusty_http`'s own untrusted-input default).
+const CHUNK_SIZE: usize = 8192;
+
+/// A generous head-size bound for a response this crate's own caller
+/// chose to connect to -- much larger than `rusty_http::head::
+/// DEFAULT_MAX_HEAD_LEN` (8 KiB, tuned for a core that also has to
+/// parse untrusted, server-bound requests). A client reading its own
+/// server's response is a more trusted context, matching this crate's
+/// original (pre-migration) bound.
+const MAX_RESPONSE_HEAD_LEN: usize = 8 * 1024 * 1024;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_REDIRECTS: usize = 30;
@@ -649,7 +664,7 @@ async fn send_with_retries(
     let mut attempt = 0usize;
     loop {
         let result = send_with_redirects(
-            method,
+            method.clone(),
             url.clone(),
             headers.clone(),
             body.clone(),
@@ -669,7 +684,7 @@ async fn send_with_retries(
             Err(e) => (policy.should_retry_error(e), None),
         };
 
-        if !should_retry || !policy.allows_method(method) || attempt >= policy.max_retries() {
+        if !should_retry || !policy.allows_method(&method) || attempt >= policy.max_retries() {
             return result;
         }
 
@@ -706,7 +721,7 @@ async fn send_with_redirects(
             build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
 
         let request = Request {
-            method,
+            method: method.clone(),
             url: url.clone(),
             headers: wire_headers,
             body: body.clone(),
@@ -866,7 +881,7 @@ async fn send_with_redirects_streaming(
             build_wire_headers(&hop_headers, &cookie_jar, &url, pool.is_some(), &body)?;
 
         let request = Request {
-            method,
+            method: method.clone(),
             url: url.clone(),
             headers: wire_headers,
             body: body.clone(),
@@ -1058,80 +1073,155 @@ async fn establish(raw: TcpStream, target: &HopTarget) -> Result<Conn> {
 const MAX_CONNECT_RESPONSE_LEN: usize = 64 * 1024;
 
 /// Sends `CONNECT host:port HTTP/1.1` on `stream` (a fresh, plain TCP
-/// connection to a proxy) and reads the status line of its response,
-/// stopping at the blank line that ends the head. A successful (2xx)
-/// `CONNECT` response never carries a body, so nothing further is read;
-/// a failing one might, but this crate has no use for it beyond the
-/// status code, so it's left undrained.
+/// connection to a proxy) and reads the status line of its response --
+/// `AsyncTransport::read_response_head` stops exactly at the blank line
+/// that ends the head, so a successful (2xx) `CONNECT` response (which
+/// never carries a body) never over-reads into what's actually the start
+/// of the tunneled TLS handshake. A failing response might carry a body,
+/// but this crate has no use for it beyond the status code, so it's left
+/// undrained -- `t.into_inner()` (dropped, here) would discard it anyway.
 async fn connect_tunnel(stream: &TcpStream, host: &str, port: u16) -> Result<StatusCode> {
     let authority = format!("{host}:{port}");
-    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
-
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(Error::InvalidResponse(
-                "proxy closed the connection before responding to CONNECT".into(),
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_CONNECT_RESPONSE_LEN {
-            return Err(Error::InvalidResponse(
-                "proxy's CONNECT response exceeded the maximum allowed length".into(),
-            ));
-        }
+    let mut t = AsyncTransport::new(stream);
+    let head = RequestHead {
+        method: Method::Connect,
+        target: authority.clone(),
+        version: Version::Http11,
+        headers: {
+            let mut h = HeaderMap::new();
+            h.insert("Host", &authority)?;
+            h
+        },
     };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let status_line = head.lines().next().unwrap_or("");
-    let code: u16 = status_line
-        .split(' ')
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| {
-            Error::InvalidResponse(format!(
-                "malformed CONNECT response status line `{status_line}`"
-            ))
-        })?;
-    Ok(StatusCode::from_u16(code))
+    t.write_request_head(&head).await?;
+    let resp_head = t.read_response_head(MAX_CONNECT_RESPONSE_LEN).await?;
+    Ok(resp_head.status)
 }
 
-async fn attempt(
+/// A response too small to have landed a real result yet; the wire
+/// contents of one head+body request/response round trip.
+struct RawResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    /// Whether `stream` is still usable for another request after this
+    /// response: the body framing left the stream in a known-clean
+    /// state (i.e. wasn't read-to-EOF) *and* the response didn't send
+    /// `Connection: close`.
+    keep_alive: bool,
+    /// Handed back so the caller can pool it (when `keep_alive`).
     stream: Conn,
-    request: &Request,
-    request_target: &str,
-) -> Result<http1::RawResponse> {
-    http1::send_request(
-        stream,
-        request.method,
-        request_target,
-        &request.url.host_header(),
-        &request.headers,
-        &request.body,
-    )
-    .await
+}
+
+/// Builds the `RequestHead` for one hop: `Host` first (matching every
+/// real client/server's convention), then `request.headers` (the wire
+/// headers `build_wire_headers` already assembled) in their original
+/// order.
+fn build_request_head(request: &Request, request_target: &str) -> Result<RequestHead> {
+    let mut headers = HeaderMap::new();
+    headers.insert("Host", &request.url.host_header())?;
+    for (name, value) in request.headers.iter() {
+        headers.append(name, value)?;
+    }
+    Ok(RequestHead {
+        method: request.method.clone(),
+        target: request_target.to_string(),
+        version: Version::Http11,
+        headers,
+    })
+}
+
+/// Writes `body` onto the wire: raw passthrough for a fully-buffered
+/// body (`Content-Length` already covers its framing), or relayed
+/// through [`write_stream_body`] for a [`Body::Stream`].
+async fn write_request_body(t: &mut AsyncTransport<Conn>, body: &Body) -> Result<()> {
+    match body {
+        Body::Empty => {}
+        Body::Bytes(b) => {
+            if !b.is_empty() {
+                t.write_body(b).await?;
+            }
+        }
+        Body::Stream(s) => write_stream_body(t, s).await?,
+    }
+    Ok(())
+}
+
+/// Relays a streaming request body onto the wire: raw passthrough when
+/// its length was declared upfront (`Content-Length` already covers
+/// framing), or `Transfer-Encoding: chunked` framing when it wasn't.
+async fn write_stream_body(
+    t: &mut AsyncTransport<Conn>,
+    body: &crate::body::StreamBody,
+) -> Result<()> {
+    let mut reader = body.open();
+    let known_length = body.len().is_some();
+    let mut buf = [0u8; CHUNK_SIZE];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if known_length {
+            t.write_body(&buf[..n]).await?;
+        } else {
+            t.write_chunk(&buf[..n]).await?;
+        }
+    }
+    if !known_length {
+        t.write_chunked_end().await?;
+    }
+    Ok(())
+}
+
+/// A `Connection` header can list multiple tokens (`Connection:
+/// keep-alive, Upgrade`); `close` anywhere in the list means the peer is
+/// closing the connection after this response.
+fn connection_says_close(headers: &HeaderMap) -> bool {
+    headers
+        .get("connection")
+        .map(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+        })
+        .unwrap_or(false)
+}
+
+async fn attempt(stream: Conn, request: &Request, request_target: &str) -> Result<RawResponse> {
+    let mut t = AsyncTransport::new(stream);
+    let head = build_request_head(request, request_target)?;
+    t.write_request_head(&head).await?;
+    write_request_body(&mut t, &request.body).await?;
+
+    let resp_head = t.read_response_head(MAX_RESPONSE_HEAD_LEN).await?;
+    let framing = body::response_framing(&resp_head.headers, &request.method, resp_head.status)?;
+    let header_says_close = connection_says_close(&resp_head.headers);
+    let keep_alive = !matches!(framing, Framing::Close) && !header_says_close;
+    let body_bytes = t.read_body(framing).await?;
+
+    Ok(RawResponse {
+        status: resp_head.status,
+        headers: resp_head.headers,
+        body: body_bytes,
+        keep_alive,
+        stream: t.into_inner(),
+    })
 }
 
 async fn attempt_streaming(
     stream: Conn,
     request: &Request,
     request_target: &str,
-) -> Result<http1::StreamingRawResponse> {
-    http1::send_request_streaming(
-        stream,
-        request.method,
-        request_target,
-        &request.url.host_header(),
-        &request.headers,
-        &request.body,
-    )
-    .await
+) -> Result<(StatusCode, HeaderMap, BodyReader<Conn>)> {
+    let mut t = AsyncTransport::new(stream);
+    let head = build_request_head(request, request_target)?;
+    t.write_request_head(&head).await?;
+    write_request_body(&mut t, &request.body).await?;
+
+    let resp_head = t.read_response_head(MAX_RESPONSE_HEAD_LEN).await?;
+    let framing = body::response_framing(&resp_head.headers, &request.method, resp_head.status)?;
+    let reader = t.into_body_reader(framing);
+    Ok((resp_head.status, resp_head.headers, reader))
 }
 
 /// Sends one request, reusing a pooled connection for this origin (or,
@@ -1184,22 +1274,21 @@ async fn send_one_hop(
 }
 
 /// Like [`send_one_hop`], but leaves the body unread -- see
-/// [`http1::send_request_streaming`]. The connection is never returned
-/// to the pool afterward (deliberate; see
-/// [`RequestBuilder::send_streaming`]'s docs), though a pooled one is
-/// still tried first and falls back to a fresh connection on failure,
-/// same as the buffered path.
+/// [`attempt_streaming`]. The connection is never returned to the pool
+/// afterward (deliberate; see [`RequestBuilder::send_streaming`]'s
+/// docs), though a pooled one is still tried first and falls back to a
+/// fresh connection on failure, same as the buffered path.
 async fn send_one_hop_streaming(
     pool: Option<&ConnectionPool>,
     request: &Request,
     proxy: Option<&Proxy>,
-) -> Result<(StatusCode, HeaderMap, http1::StreamingBody)> {
+) -> Result<(StatusCode, HeaderMap, BodyReader<Conn>)> {
     let target = hop_target(&request.url, proxy);
 
     if let Some(pool) = pool {
         if let Some(stream) = pool.take(&target.pool_key) {
-            if let Ok(raw) = attempt_streaming(stream, request, &target.request_target).await {
-                return Ok((raw.status, raw.headers, raw.body));
+            if let Ok(result) = attempt_streaming(stream, request, &target.request_target).await {
+                return Ok(result);
             }
         }
     }
@@ -1207,8 +1296,7 @@ async fn send_one_hop_streaming(
     let addrs = resolve(target.connect_host.clone(), target.connect_port).await?;
     let raw = connect(&addrs).await?;
     let stream = establish(raw, &target).await?;
-    let raw = attempt_streaming(stream, request, &target.request_target).await?;
-    Ok((raw.status, raw.headers, raw.body))
+    attempt_streaming(stream, request, &target.request_target).await
 }
 
 /// DNS resolution is a blocking OS call (`getaddrinfo` under the hood);

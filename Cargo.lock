@@ -227,11 +227,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_http"
+version = "0.1.0"
+source = "git+https://github.com/baileyrd/rusty_http?rev=7ddc011628c55330ec8dab33524b290cae927426#7ddc011628c55330ec8dab33524b290cae927426"
+dependencies = [
+ "rusty_tokio",
+]
+
+[[package]]
 name = "rusty_request"
 version = "0.1.0"
 dependencies = [
  "rcgen",
  "rustls",
+ "rusty_http",
  "rusty_tls",
  "rusty_tokio",
 ]

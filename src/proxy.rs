@@ -16,7 +16,7 @@
 
 use crate::error::{Error, Result};
 use crate::pool::PoolKey;
-use crate::url::Url;
+use rusty_http::Url;
 
 /// An HTTP forward proxy: requests go to `host:port` instead of the
 /// request's own origin. An `http://` request uses the origin's full

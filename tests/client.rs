@@ -470,10 +470,15 @@ fn unrecognized_scheme_is_rejected_before_connecting() {
     // support has landed, http:// and https:// both proceed (a real
     // https:// round trip is covered by tests/https.rs). A genuinely
     // unrecognized scheme is still rejected, at `Url::parse`, before any
-    // network I/O.
+    // network I/O -- as `Error::UnsupportedScheme` since the
+    // rusty_http migration (previously `Error::InvalidUrl`):
+    // `rusty_http::Url::parse` distinguishes a URL that's simply
+    // malformed from one that parses fine but names a scheme this
+    // crate doesn't support, which is the more precise description of
+    // what happens here.
     run(async {
         let result = rusty_request::get("ftp://example.com/").await;
-        assert!(matches!(result, Err(Error::InvalidUrl(_))));
+        assert!(matches!(result, Err(Error::UnsupportedScheme(_))));
     });
 }
 

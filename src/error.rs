@@ -29,8 +29,10 @@ pub enum Error {
     /// A `CONNECT` tunnel through a configured proxy (required to reach
     /// an `https://` origin through an `http://` proxy) was rejected --
     /// the proxy responded to `CONNECT host:port` with a non-2xx status.
-    ProxyConnectFailed(crate::status::StatusCode),
-    /// The peer's response didn't parse as HTTP/1.1.
+    ProxyConnectFailed(rusty_http::StatusCode),
+    /// The peer's response didn't parse as HTTP/1.1, or its declared
+    /// body framing was violated (e.g. the connection closed before the
+    /// full body arrived).
     InvalidResponse(String),
     /// `.json()` was called but the body isn't valid JSON, or a JSON
     /// body was given whose structure doesn't match what was asked for.
@@ -39,7 +41,7 @@ pub enum Error {
     Timeout,
     /// [`crate::Response::error_for_status`] was called on a response
     /// with a 4xx/5xx status.
-    Status(crate::status::StatusCode),
+    Status(rusty_http::StatusCode),
     /// A redirect chain exceeded the configured cap (see
     /// `RequestBuilder::max_redirects`/`ClientBuilder::max_redirects`)
     /// without settling on a non-redirect response.
@@ -90,6 +92,30 @@ impl From<std::io::Error> for Error {
 impl From<rusty_tls::Error> for Error {
     fn from(e: rusty_tls::Error) -> Self {
         Error::Tls(e)
+    }
+}
+
+impl From<rusty_http::Error> for Error {
+    fn from(e: rusty_http::Error) -> Self {
+        match e {
+            rusty_http::Error::InvalidUrl(s) => Error::InvalidUrl(s),
+            rusty_http::Error::UnsupportedScheme(s) => Error::UnsupportedScheme(s),
+            rusty_http::Error::InvalidHeader(s) => Error::InvalidHeader(s),
+            other => Error::InvalidResponse(other.to_string()),
+        }
+    }
+}
+
+/// `rusty_http`'s transport adapters report I/O failures and framing
+/// violations through their own error type (the sans-IO core has no
+/// `Io` variant of its own) -- both map onto this crate's existing
+/// flattened `Error`.
+impl From<rusty_http::TransportError> for Error {
+    fn from(e: rusty_http::TransportError) -> Self {
+        match e {
+            rusty_http::TransportError::Io(io) => Error::Io(io),
+            rusty_http::TransportError::Http(http) => http.into(),
+        }
     }
 }
 

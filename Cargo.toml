@@ -2,19 +2,18 @@
 name = "rusty_request"
 version = "0.1.0"
 edition = "2021"
-description = "A hand-rolled, async, zero-crates-io-dependency HTTP client -- a Rust take on Python's requests, built on rusty_tokio."
+description = "An async HTTP client -- a Rust take on Python's requests, built on rusty_tokio and rusty_http."
 license = "MIT"
 
 [dependencies]
 # Our own hand-rolled async runtime (scheduler, reactor, timers) -- no
-# tokio, no mio, no crates.io HTTP/URL/JSON crates. Everything above the
-# raw socket (URL parsing, HTTP/1.1 framing, JSON) is original code in
-# this crate. Pinned to the same rev as `rusty_tls` below (bumped from
-# fbeda3b9) -- required, not just tidy: `rusty_tls::AsyncTlsStream` is
-# generic over this crate's own `AsyncRead`/`AsyncWrite` traits, and Cargo
-# treats two different revs of the same git dependency as two unrelated
-# crates, so their trait/type identities wouldn't match at a different
-# rev even though the source is otherwise compatible.
+# tokio, no mio. Pinned to the same rev as `rusty_tls`/`rusty_http` below
+# (bumped from fbeda3b9) -- required, not just tidy: `rusty_tls::AsyncTlsStream`
+# and `rusty_http::async_tokio::AsyncTransport` are both generic over this
+# crate's own `AsyncRead`/`AsyncWrite` traits, and Cargo treats two
+# different revs of the same git dependency as two unrelated crates, so
+# their trait/type identities wouldn't match at a different rev even
+# though the source is otherwise compatible.
 rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "ac598c930e85460ae3f79328a1d82f28390672f8" }
 # The ecosystem's one shared TLS implementation and trust policy (see its
 # own README/ARCHITECTURE.md) -- this crate is the design's first named
@@ -24,6 +23,18 @@ rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "ac598c93
 # for why both pins have to move together.
 rusty_tls = { git = "https://github.com/baileyrd/rusty_tls", rev = "415d8e0d1b58461990377b9e2cdc8799492f8efc", features = [
     "rusty-tokio",
+] }
+# The ecosystem's one shared HTTP/1.1 message layer + Url type (see its
+# own README/ARCHITECTURE.md) -- this crate is its first migrated
+# consumer, retiring its own hand-rolled http1.rs/url.rs/cookie.rs/
+# header.rs/method.rs/status.rs in favor of it. `rusty-tokio` enables the
+# async transport adapter this crate's connector needs; `cookies` enables
+# the RFC 6265 jar `Client`'s cookie store already depended on. Pinned to
+# a specific rev, same convention (and same reasoning) as `rusty_tokio`
+# above.
+rusty_http = { git = "https://github.com/baileyrd/rusty_http", rev = "7ddc011628c55330ec8dab33524b290cae927426", features = [
+    "rusty-tokio",
+    "cookies",
 ] }
 
 [dev-dependencies]
