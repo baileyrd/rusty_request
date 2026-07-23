@@ -19,9 +19,14 @@ no `hyper`, no `reqwest`, no `serde`, no `url` crate.
 [`rusty_tls`](https://github.com/baileyrd/rusty_tls) -- the ecosystem's
 one shared TLS implementation and trust policy, not anything hand-rolled
 here. Every `https://` request is verified by default against the system
-trust store, with SNI from the URL host; this crate has no public API to
-configure a different trust policy today. TLS 1.2/1.3, no ALPN (this
-crate is HTTP/1.1-only), no client certificates.
+trust store (`TrustPolicy::System`), with SNI from the URL host.
+`ClientBuilder::trust_policy`/`RequestBuilder::trust_policy` (per-request
+overriding the client default) configure a different policy: pin a
+private CA via `rusty_request::pinned_anchors(der_certs)`
+(`TrustPolicy::PinnedAnchors`), or disable verification entirely via
+`TrustPolicy::DangerNoVerification` (never for production use -- no
+protection against an active man-in-the-middle). TLS 1.2/1.3, no ALPN
+(this crate is HTTP/1.1-only), no client certificates.
 
 ## What's here (MVP)
 
@@ -180,11 +185,10 @@ async fn main() -> rusty_request::Result<()> {
 
 Tracked as issues in this repository:
 
-- **A configurable TLS trust policy.** Every `https://` request uses
-  `rusty_tls::TrustPolicy::System` today; there's no way to pin a
-  private CA or opt into `DangerNoVerification` from this crate's own
-  API.
-- **HTTP/2 / ALPN.** This crate is HTTP/1.1-only.
+- **HTTP/2 / ALPN.** This crate is HTTP/1.1-only, and `rusty_tls` (the
+  ecosystem's shared TLS implementation) has no ALPN support to build on
+  yet -- blocked on that upstream work, not something this crate can add
+  on its own.
 
 ## Testing
 

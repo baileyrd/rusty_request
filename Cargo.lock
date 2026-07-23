@@ -240,6 +240,7 @@ version = "0.1.0"
 dependencies = [
  "rcgen",
  "rustls",
+ "rustls-pki-types",
  "rusty_http",
  "rusty_tls",
  "rusty_tokio",
