@@ -20,8 +20,11 @@ rusty_tokio = { git = "https://github.com/baileyrd/rusty_tokio", rev = "ac598c93
 # consumer. `rusty-tokio` feature enables its async adapter, which is
 # what this crate's connector needs. Pinned to a specific rev, same
 # convention as `rusty_tokio` above -- and see that dependency's comment
-# for why both pins have to move together.
-rusty_tls = { git = "https://github.com/baileyrd/rusty_tls", rev = "415d8e0d1b58461990377b9e2cdc8799492f8efc", features = [
+# for why both pins have to move together. Bumped from 415d8e0d to pick
+# up ALPN protocol negotiation (`AsyncTlsStream::new_with_alpn`/
+# `negotiated_alpn_protocol`) -- this rev's own `rusty_tokio` pin is
+# unchanged (still `ac598c93`), so no matching bump is needed there.
+rusty_tls = { git = "https://github.com/baileyrd/rusty_tls", rev = "233598faf2ffc76c38cd901019f466c1ab0e2267", features = [
     "rusty-tokio",
 ] }
 # The ecosystem's one shared HTTP/1.1 message layer + Url type (see its

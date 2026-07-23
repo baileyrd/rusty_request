@@ -249,7 +249,7 @@ dependencies = [
 [[package]]
 name = "rusty_tls"
 version = "0.1.0"
-source = "git+https://github.com/baileyrd/rusty_tls?rev=415d8e0d1b58461990377b9e2cdc8799492f8efc#415d8e0d1b58461990377b9e2cdc8799492f8efc"
+source = "git+https://github.com/baileyrd/rusty_tls?rev=233598faf2ffc76c38cd901019f466c1ab0e2267#233598faf2ffc76c38cd901019f466c1ab0e2267"
 dependencies = [
  "rustls",
  "rustls-native-certs",
