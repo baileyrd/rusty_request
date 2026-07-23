@@ -36,6 +36,15 @@ rusty_http = { git = "https://github.com/baileyrd/rusty_http", rev = "7ddc011628
     "rusty-tokio",
     "cookies",
 ] }
+# Only for `TrustPolicy::PinnedAnchors`'s `CertificateDer` type -- so a
+# caller pinning a private CA never needs their own direct dependency on
+# `rustls` itself. This is the same type `rusty_tls::TrustPolicy` already
+# requires (re-exported from `rustls::pki_types`, per that crate's own
+# Cargo.toml); depending on the small, no-crypto `rustls-pki-types` crate
+# directly (rather than all of `rustls`) keeps this to a types-only
+# dependency, already present in the build graph at a compatible version
+# via `rusty_tls`/the `rustls` dev-dependency below.
+rustls-pki-types = "1"
 
 [dev-dependencies]
 # Test-only: builds a local TLS server (via a self-signed cert) to

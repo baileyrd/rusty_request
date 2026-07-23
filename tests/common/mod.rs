@@ -353,11 +353,11 @@ impl rusty_tokio::io::AsyncRead for MemoryReader {
 }
 
 /// A TLS counterpart to [`start_test_server`], for exercising the
-/// `https://` connector: a self-signed CA (returned as PEM so a test can
-/// point `SSL_CERT_FILE` at it -- this crate's public API has no way to
-/// pass a custom trust policy through, so that's the only hermetic way
-/// to make `rusty_tls::TrustPolicy::System` trust a test certificate)
-/// signs a leaf certificate valid for `localhost`, and each accepted
+/// `https://` connector: a self-signed CA (returned as both PEM, for a
+/// test that wants to exercise `TrustPolicy::System` by pointing
+/// `SSL_CERT_FILE` at it, and DER, for a test that pins it directly via
+/// `rusty_request::pinned_anchors`/`TrustPolicy::PinnedAnchors`) signs a
+/// leaf certificate valid for `localhost`, and each accepted
 /// connection is served -- request in, response out, request in, ... --
 /// on its own background OS thread, using a synchronous
 /// `rustls::StreamOwned` exactly like `rusty_tls`'s own hermetic tests
@@ -368,6 +368,10 @@ pub struct TestTlsServer {
     pub addr: SocketAddr,
     /// PEM-encoded CA certificate that signed this server's leaf cert.
     pub ca_cert_pem: String,
+    /// The same CA certificate, DER-encoded -- what
+    /// `rusty_request::pinned_anchors` (and `TrustPolicy::PinnedAnchors`
+    /// underneath it) actually take.
+    pub ca_cert_der: Vec<u8>,
 }
 
 pub fn start_tls_test_server<F>(handler: F) -> TestTlsServer
@@ -428,6 +432,7 @@ where
     TestTlsServer {
         addr,
         ca_cert_pem: ca_cert.pem(),
+        ca_cert_der: ca_cert.der().to_vec(),
     }
 }
 

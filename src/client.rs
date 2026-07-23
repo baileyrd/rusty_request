@@ -15,6 +15,7 @@ use rusty_http::cookie::CookieJar;
 use rusty_http::head::RequestHead;
 use rusty_http::url::percent_encode;
 use rusty_http::{HeaderMap, Method, StatusCode, Url, Version};
+use rusty_tls::TrustPolicy;
 use rusty_tokio::io::{AsyncReadExt, TcpStream};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,7 @@ pub struct Client {
     retry_policy: Option<RetryPolicy>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 }
 
 impl Client {
@@ -92,6 +94,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             proxy: self.proxy.clone(),
             proxy_bypass: self.proxy_bypass.clone(),
+            trust_policy: self.trust_policy.clone(),
         })
     }
 
@@ -137,6 +140,7 @@ pub struct ClientBuilder {
     retry_policy: Option<RetryPolicy>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 }
 
 impl ClientBuilder {
@@ -156,6 +160,7 @@ impl ClientBuilder {
             retry_policy: None,
             proxy: None,
             proxy_bypass: NoProxyRules::default(),
+            trust_policy: TrustPolicy::default(),
         }
     }
 
@@ -330,6 +335,19 @@ impl ClientBuilder {
         self
     }
 
+    /// How every `https://` request built from the resulting [`Client`]
+    /// decides whether to trust the server it connects to. Defaults to
+    /// [`TrustPolicy::System`] (the OS trust store) -- the same behavior
+    /// this crate always had, just now overridable. Use
+    /// [`crate::pinned_anchors`] to pin a private CA, or
+    /// [`TrustPolicy::DangerNoVerification`] to disable verification
+    /// entirely (never for production use -- no protection against an
+    /// active man-in-the-middle). Ignored for `http://` requests.
+    pub fn trust_policy(mut self, policy: TrustPolicy) -> Self {
+        self.trust_policy = policy;
+        self
+    }
+
     pub fn build(self) -> Client {
         Client {
             default_headers: self.default_headers,
@@ -345,6 +363,7 @@ impl ClientBuilder {
             retry_policy: self.retry_policy,
             proxy: self.proxy,
             proxy_bypass: self.proxy_bypass,
+            trust_policy: self.trust_policy,
         }
     }
 }
@@ -389,6 +408,7 @@ pub struct RequestBuilder {
     retry_policy: Option<RetryPolicy>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 }
 
 impl RequestBuilder {
@@ -535,6 +555,14 @@ impl RequestBuilder {
         self
     }
 
+    /// How this request (if `https://`) decides whether to trust the
+    /// server it connects to, overriding the `Client`'s default. See
+    /// [`ClientBuilder::trust_policy`].
+    pub fn trust_policy(mut self, policy: TrustPolicy) -> Self {
+        self.trust_policy = policy;
+        self
+    }
+
     pub async fn send(self) -> Result<Response> {
         let RequestBuilder {
             method,
@@ -548,6 +576,7 @@ impl RequestBuilder {
             retry_policy,
             proxy,
             proxy_bypass,
+            trust_policy,
         } = self;
 
         let fut = send_with_retries(
@@ -561,6 +590,7 @@ impl RequestBuilder {
             retry_policy,
             proxy,
             proxy_bypass,
+            trust_policy,
         );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
@@ -605,6 +635,7 @@ impl RequestBuilder {
             retry_policy: _,
             proxy,
             proxy_bypass,
+            trust_policy,
         } = self;
 
         let fut = send_with_redirects_streaming(
@@ -617,6 +648,7 @@ impl RequestBuilder {
             pool,
             proxy,
             proxy_bypass,
+            trust_policy,
         );
         match request_timeout {
             Some(d) => match rusty_tokio::time::timeout(d, fut).await {
@@ -645,6 +677,7 @@ async fn send_with_retries(
     retry_policy: Option<RetryPolicy>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 ) -> Result<Response> {
     let Some(policy) = retry_policy else {
         return send_with_redirects(
@@ -657,6 +690,7 @@ async fn send_with_retries(
             pool,
             proxy,
             proxy_bypass,
+            trust_policy,
         )
         .await;
     };
@@ -673,6 +707,7 @@ async fn send_with_retries(
             pool.clone(),
             proxy.clone(),
             proxy_bypass.clone(),
+            trust_policy.clone(),
         )
         .await;
 
@@ -707,6 +742,7 @@ async fn send_with_redirects(
     pool: Option<Arc<ConnectionPool>>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 ) -> Result<Response> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -727,7 +763,8 @@ async fn send_with_redirects(
             body: body.clone(),
             timeout: None,
         };
-        let response = send_one_hop(pool.as_deref(), &request, proxy_for_hop).await?;
+        let response =
+            send_one_hop(pool.as_deref(), &request, proxy_for_hop, &trust_policy).await?;
 
         // Store cookies from every hop's response, not just the final
         // one -- an intermediate redirect can set cookies too, and they
@@ -867,6 +904,7 @@ async fn send_with_redirects_streaming(
     pool: Option<Arc<ConnectionPool>>,
     proxy: Option<Proxy>,
     proxy_bypass: NoProxyRules,
+    trust_policy: TrustPolicy,
 ) -> Result<StreamingResponse> {
     let mut hop_headers = headers;
     let mut hop = 0usize;
@@ -888,7 +926,7 @@ async fn send_with_redirects_streaming(
             timeout: None,
         };
         let (status, resp_headers, mut streaming_body) =
-            send_one_hop_streaming(pool.as_deref(), &request, proxy_for_hop).await?;
+            send_one_hop_streaming(pool.as_deref(), &request, proxy_for_hop, &trust_policy).await?;
 
         if let Some(jar) = &cookie_jar {
             let set_cookie_values: Vec<&str> = resp_headers
@@ -1049,10 +1087,9 @@ fn hop_target(url: &Url, proxy: Option<&Proxy>) -> HopTarget {
 /// `target` actually calls for: a `CONNECT`-tunnel handshake first, if
 /// `target.connect_tunnel` says this hop needs one (`https://` routed
 /// through a proxy), then a TLS handshake, if `target.tls_server_name`
-/// says so (any `https://` hop, tunneled or direct) -- verified against
-/// the system trust store (`rusty_tls::TrustPolicy::System`); this MVP
-/// doesn't expose a way to configure a different policy.
-async fn establish(raw: TcpStream, target: &HopTarget) -> Result<Conn> {
+/// says so (any `https://` hop, tunneled or direct) -- verified per
+/// `trust_policy` (see [`ClientBuilder::trust_policy`]).
+async fn establish(raw: TcpStream, target: &HopTarget, trust_policy: &TrustPolicy) -> Result<Conn> {
     if let Some((host, port)) = &target.connect_tunnel {
         let status = connect_tunnel(&raw, host, *port).await?;
         if !status.is_success() {
@@ -1061,7 +1098,7 @@ async fn establish(raw: TcpStream, target: &HopTarget) -> Result<Conn> {
     }
     match &target.tls_server_name {
         Some(name) => {
-            let tls = rusty_tls::AsyncTlsStream::new(raw, name, &rusty_tls::TrustPolicy::System)?;
+            let tls = rusty_tls::AsyncTlsStream::new(raw, name, trust_policy)?;
             Ok(Conn::Tls(Box::new(tls)))
         }
         None => Ok(Conn::Plain(raw)),
@@ -1237,6 +1274,7 @@ async fn send_one_hop(
     pool: Option<&ConnectionPool>,
     request: &Request,
     proxy: Option<&Proxy>,
+    trust_policy: &TrustPolicy,
 ) -> Result<Response> {
     let target = hop_target(&request.url, proxy);
 
@@ -1258,7 +1296,7 @@ async fn send_one_hop(
 
     let addrs = resolve(target.connect_host.clone(), target.connect_port).await?;
     let raw = connect(&addrs).await?;
-    let stream = establish(raw, &target).await?;
+    let stream = establish(raw, &target, trust_policy).await?;
     let raw = attempt(stream, request, &target.request_target).await?;
     if raw.keep_alive {
         if let Some(pool) = pool {
@@ -1282,6 +1320,7 @@ async fn send_one_hop_streaming(
     pool: Option<&ConnectionPool>,
     request: &Request,
     proxy: Option<&Proxy>,
+    trust_policy: &TrustPolicy,
 ) -> Result<(StatusCode, HeaderMap, BodyReader<Conn>)> {
     let target = hop_target(&request.url, proxy);
 
@@ -1295,7 +1334,7 @@ async fn send_one_hop_streaming(
 
     let addrs = resolve(target.connect_host.clone(), target.connect_port).await?;
     let raw = connect(&addrs).await?;
-    let stream = establish(raw, &target).await?;
+    let stream = establish(raw, &target, trust_policy).await?;
     attempt_streaming(stream, request, &target.request_target).await
 }
 

@@ -34,9 +34,14 @@
 //!   opts out.
 //! - `http://` and `https://`. TLS is [`rusty_tls`](https://github.com/baileyrd/rusty_tls)'s,
 //!   not hand-rolled: verified by default against the system trust store,
-//!   SNI from the URL host, TLS 1.2/1.3. No ALPN (this crate is
-//!   HTTP/1.1-only), no client certificates, no custom trust policy --
-//!   see the README and issue tracker for tracked follow-ups.
+//!   SNI from the URL host, TLS 1.2/1.3. The trust policy is configurable
+//!   via `ClientBuilder::trust_policy`/`RequestBuilder::trust_policy`
+//!   ([`TrustPolicy::System`] by default, [`TrustPolicy::PinnedAnchors`]
+//!   via [`pinned_anchors`] to pin a private CA, or
+//!   [`TrustPolicy::DangerNoVerification`] to disable verification
+//!   entirely). No ALPN (this crate is HTTP/1.1-only), no client
+//!   certificates -- see the README and issue tracker for tracked
+//!   follow-ups.
 //! - Connection pooling: every `Client` reuses idle connections per
 //!   origin when the server allows it (HTTP/1.1's keep-alive default),
 //!   bounded by a per-origin idle cap and timeout, with a stale pooled
@@ -98,6 +103,7 @@ mod response;
 mod retry;
 mod stream;
 mod streaming;
+mod tls;
 
 pub use body::Body;
 pub use client::{Client, ClientBuilder, RequestBuilder};
@@ -109,7 +115,9 @@ pub use request::Request;
 pub use response::Response;
 pub use retry::{Backoff, RetryPolicy};
 pub use rusty_http::{HeaderMap, Method, StatusCode, Url};
+pub use rusty_tls::TrustPolicy;
 pub use streaming::StreamingResponse;
+pub use tls::pinned_anchors;
 
 /// `GET url` via a fresh, default [`Client`]. For repeated requests
 /// (shared headers, a shared timeout, connection reuse, cookies),
