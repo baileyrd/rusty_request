@@ -1,5 +1,11 @@
 # rusty_request
 
+> **This repository has moved.** `rusty_request` now lives at
+> [`crates/rusty_request`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_request)
+> in the [`rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) monorepo, with full commit
+> history preserved. This repository is kept for historical reference and is no longer
+> developed; please open issues and pull requests against `rusty_mill` instead.
+
 An async HTTP client for Rust -- a take on Python's `requests`, built on
 our own from-scratch async runtime
 ([`rusty_tokio`](https://github.com/baileyrd/rusty_tokio)) instead of
